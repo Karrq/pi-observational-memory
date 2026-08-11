@@ -172,7 +172,9 @@ type ModelResolver = {
 };
 
 function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): ModelResolver {
-	let cached: ResolveResult | undefined;
+	// Cached per stage, not once per pass: modelMap entries can route each stage
+	// to a different model.
+	const cache = new Map<ConsolidationPhase, ResolveResult>();
 	// Once the fallback proves usable, keep it for the rest of the pass so later
 	// stages do not re-pay a known-broken primary.
 	let fallbackActive: ResolvedModel | undefined;
@@ -182,19 +184,24 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): ModelResolv
 			runtime.resolveFailureNotified = false;
 			return fallbackActive;
 		}
-		cached ??= await runtime.resolveModel({
-			model: ctx.model,
-			modelRegistry: ctx.modelRegistry,
-			hasUI: ctx.hasUI,
-			ui: ctx.ui,
-		});
-		if (cached.ok) {
-			runtime.resolveFailureNotified = false;
-			return workerHeadersFor(ctx, cached);
+		let resolved = cache.get(stage);
+		if (!resolved) {
+			resolved = await runtime.resolveModel({
+				model: ctx.model,
+				modelRegistry: ctx.modelRegistry,
+				hasUI: ctx.hasUI,
+				ui: ctx.ui,
+				stage,
+			});
+			cache.set(stage, resolved);
 		}
-		debugLog(`${stage}.model_unavailable`, { reason: cached.reason });
+		if (resolved.ok) {
+			runtime.resolveFailureNotified = false;
+			return workerHeadersFor(ctx, resolved);
+		}
+		debugLog(`${stage}.model_unavailable`, { reason: resolved.reason });
 		if (!runtime.resolveFailureNotified && ctx.hasUI && ctx.ui) {
-			ctx.ui.notify(`Observational memory: ${stage} skipped — ${cached.reason}`, "warning");
+			ctx.ui.notify(`Observational memory: ${stage} skipped — ${resolved.reason}`, "warning");
 			runtime.resolveFailureNotified = true;
 		}
 		return undefined;
@@ -212,6 +219,7 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): ModelResolv
 			modelRegistry: ctx.modelRegistry,
 			hasUI: ctx.hasUI,
 			ui: ctx.ui,
+			stage,
 		};
 		const result = await resolveFallbackModel.call(runtime, resolvedCtx);
 		if (!result.ok) {

@@ -327,7 +327,25 @@ Set `showWorkerNotifications` to `false` to hide routine worker start and comple
 }
 ```
 
-Each entry may also set `thinking`. This is a local patch (`src/config.ts`, `src/runtime.ts`) on top of upstream `master` and is not part of the published package.
+Each entry may also set `thinking`.
+
+An entry may set `stages` to narrow it to any of `observer`, `reflector`, `dropper`, so the cheap extraction stages and the expensive distillation stage can use different models. An entry without `stages` serves every stage, so order a stage-specific entry before the general one:
+
+```json
+{
+  "observational-memory": {
+    "reflectAfterTokens": 50000,
+    "modelMap": [
+      { "match": "*", "stages": ["reflector"], "provider": "claude-bridge", "id": "claude-sonnet-5", "thinking": "high" },
+      { "match": "*", "provider": "synthetic", "id": "syn:small:text" }
+    ]
+  }
+}
+```
+
+Stage names are validated: an entry whose `stages` contains no recognized stage is discarded rather than treated as unrestricted, so a misspelled stage cannot silently route the reflector's model to every stage. Each stage resolves its model independently, once per consolidation run.
+
+This is a local patch (`src/config.ts`, `src/runtime.ts`, `src/hooks/consolidation-trigger.ts`) on top of upstream `master` and is not part of the published package.
 
 `observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max.
 

@@ -30,15 +30,25 @@ export interface ConfiguredModel {
  */
 export type CompactAfterTokensMode = "calibrated" | "ratio";
 
+/** The three memory-worker stages, each resolved independently. */
+export type MemoryStage = "observer" | "reflector" | "dropper";
+
+export const MEMORY_STAGE_VALUES: readonly MemoryStage[] = ["observer", "reflector", "dropper"] as const;
+
 /**
  * A glob-matched routing rule for the memory-worker model.
  *
  * `match` is a glob (`*` and `?` wildcards) tested against the active session
  * model's `"<provider>/<id>"` key. The first entry in `modelMap` whose
  * `match` matches wins; if none match, `model` (or the session model) is used.
+ *
+ * `stages` narrows an entry to specific stages, so cheap extraction work and
+ * expensive distillation can route to different models. Omit it to apply the
+ * entry to every stage.
  */
 export interface ModelMapEntry {
 	match: string;
+	stages?: MemoryStage[];
 	provider: string;
 	id: string;
 	thinking?: ModelThinkingLevel;
@@ -219,6 +229,16 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	return model;
 }
 
+function isMemoryStage(value: unknown): value is MemoryStage {
+	return typeof value === "string" && (MEMORY_STAGE_VALUES as readonly string[]).includes(value);
+}
+
+function normalizeStages(value: unknown): MemoryStage[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const stages = value.filter(isMemoryStage);
+	return stages.length > 0 ? [...new Set(stages)] : undefined;
+}
+
 function normalizeModelMapEntry(value: unknown): ModelMapEntry | undefined {
 	if (!isRecord(value)) return undefined;
 	const match = nonEmptyString(value.match);
@@ -226,6 +246,12 @@ function normalizeModelMapEntry(value: unknown): ModelMapEntry | undefined {
 	const id = nonEmptyString(value.id);
 	if (!match || !provider || !id) return undefined;
 	const entry: ModelMapEntry = { match, provider, id };
+	// A present-but-unusable `stages` rejects the entry rather than widening it to
+	// every stage: a misspelled stage would otherwise silently route the costly
+	// reflector model to observer and dropper too.
+	const stages = normalizeStages(value.stages);
+	if (value.stages !== undefined && !stages) return undefined;
+	if (stages) entry.stages = stages;
 	if (isThinkingLevel(value.thinking)) entry.thinking = value.thinking;
 	return entry;
 }
@@ -258,13 +284,20 @@ export function activeModelKey(model: unknown): string | undefined {
 
 /**
  * Resolve the memory-worker model routing for the given active session model:
- * the first `modelMap` entry whose `match` glob matches `"<provider>/<id>"`,
- * falling back to the static `model` config if none match.
+ * the first `modelMap` entry whose `match` glob matches `"<provider>/<id>"` and
+ * whose `stages` admits `stage`, falling back to the static `model` config if
+ * none match. An entry without `stages` applies to every stage; a caller
+ * without a `stage` only matches unrestricted entries.
  */
-export function resolveConfiguredModel(config: Config, activeModel: unknown): ConfiguredModel | undefined {
+export function resolveConfiguredModel(
+	config: Config,
+	activeModel: unknown,
+	stage?: MemoryStage,
+): ConfiguredModel | undefined {
 	const key = activeModelKey(activeModel);
 	if (key) {
 		for (const entry of config.modelMap) {
+			if (entry.stages && (!stage || !entry.stages.includes(stage))) continue;
 			if (globToRegExp(entry.match).test(key)) {
 				return { provider: entry.provider, id: entry.id, thinking: entry.thinking };
 			}

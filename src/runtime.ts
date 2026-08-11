@@ -1,5 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { type Config, DEFAULTS, loadConfig, resolveConfiguredModel } from "./config.js";
+import { type Config, DEFAULTS, loadConfig, type MemoryStage, resolveConfiguredModel } from "./config.js";
 import { debugLog } from "./debug-log.js";
 
 export type ResolveResult =
@@ -102,6 +102,7 @@ export interface ResolveCtx {
 	modelRegistry: any;
 	hasUI: boolean;
 	ui?: { notify: Notify };
+	stage?: MemoryStage;
 }
 
 export interface LaunchCtx {
@@ -169,7 +170,7 @@ export class Runtime {
 	/** The `modelMap` match or `config.model` when it resolves in Pi's registry, otherwise the session model. */
 	private async resolvePrimaryModel(ctx: ResolveCtx): Promise<ResolveResult> {
 		let model = ctx.model;
-		const configured = resolveConfiguredModel(this.config, ctx.model);
+		const configured = resolveConfiguredModel(this.config, ctx.model, ctx.stage);
 		let thinking = configured?.thinking;
 		if (configured) {
 			const found = ctx.modelRegistry.find(configured.provider, configured.id);
@@ -201,7 +202,7 @@ export class Runtime {
 		// re-run the exact failure instead of adding a second chance. The effective
 		// primary is the configured model when it resolves, else the session model,
 		// matching `resolvePrimaryModel`.
-		const configured = resolveConfiguredModel(this.config, ctx.model);
+		const configured = resolveConfiguredModel(this.config, ctx.model, ctx.stage);
 		const configuredResolved = configured
 			? (ctx.modelRegistry.find(configured.provider, configured.id) as { provider?: string; id?: string } | undefined)
 			: undefined;

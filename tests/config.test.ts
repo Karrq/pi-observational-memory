@@ -9,7 +9,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	getAgentDir: () => mock.agentDir,
 }));
 
-import { DEFAULTS, loadConfig, readEnvConfig, resolveCompactAfterTokens } from "../src/config.js";
+import { DEFAULTS, loadConfig, readEnvConfig, resolveCompactAfterTokens, resolveConfiguredModel } from "../src/config.js";
 
 function writeJson(path: string, value: unknown) {
 	mkdirSync(join(path, ".."), { recursive: true });
@@ -46,6 +46,7 @@ describe("V3 config", () => {
 			agentMaxTurns: 16,
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
+			modelMap: [],
 			passive: false,
 			debugLog: false,
 			modelMap: [],
@@ -301,6 +302,73 @@ describe("V3 config", () => {
 			expect(resolveCompactAfterTokens(config, undefined)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, 0)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, -1)).toBe(81000);
+		});
+	});
+
+	describe("resolveConfiguredModel", () => {
+		const withMap = (modelMap: any[], model?: any) => ({ ...DEFAULTS, modelMap, model }) as any;
+
+		it("routes by glob against the active model's provider/id key", () => {
+			const config = withMap([
+				{ match: "claude-bridge/*", provider: "claude-bridge", id: "sonnet" },
+				{ match: "*", provider: "synthetic", id: "small" },
+			]);
+			expect(resolveConfiguredModel(config, { provider: "claude-bridge", id: "opus-5" })).toEqual({
+				provider: "claude-bridge",
+				id: "sonnet",
+				thinking: undefined,
+			});
+			expect(resolveConfiguredModel(config, { provider: "openai", id: "gpt" })).toEqual({
+				provider: "synthetic",
+				id: "small",
+				thinking: undefined,
+			});
+		});
+
+		it("falls back to the static model config when nothing matches", () => {
+			const fallback = { provider: "anthropic", id: "memory" };
+			const config = withMap([{ match: "claude-bridge/*", provider: "x", id: "y" }], fallback);
+			expect(resolveConfiguredModel(config, { provider: "openai", id: "gpt" })).toBe(fallback);
+			expect(resolveConfiguredModel(config, undefined)).toBe(fallback);
+		});
+
+		it("routes stages independently and lets unrestricted entries serve any stage", () => {
+			const config = withMap([
+				{ match: "*", stages: ["reflector"], provider: "anthropic", id: "big", thinking: "high" },
+				{ match: "*", provider: "synthetic", id: "small" },
+			]);
+			const active = { provider: "claude-bridge", id: "opus-5" };
+			expect(resolveConfiguredModel(config, active, "reflector")).toEqual({
+				provider: "anthropic",
+				id: "big",
+				thinking: "high",
+			});
+			for (const stage of ["observer", "dropper"] as const) {
+				expect(resolveConfiguredModel(config, active, stage)).toEqual({
+					provider: "synthetic",
+					id: "small",
+					thinking: undefined,
+				});
+			}
+		});
+
+		it("skips stage-restricted entries when no stage is given", () => {
+			const config = withMap([{ match: "*", stages: ["reflector"], provider: "anthropic", id: "big" }]);
+			expect(resolveConfiguredModel(config, { provider: "openai", id: "gpt" })).toBeUndefined();
+		});
+
+		it("rejects an entry whose stages are all unknown rather than widening it to every stage", () => {
+			writeJson(join(agentDir, "settings.json"), {
+				"observational-memory": {
+					modelMap: [
+						{ match: "*", stages: ["bogus"], provider: "anthropic", id: "big" },
+						{ match: "*", stages: ["observer", "bogus", "observer"], provider: "synthetic", id: "small" },
+					],
+				},
+			});
+			expect(loadConfig(cwd, {}).modelMap).toEqual([
+				{ match: "*", stages: ["observer"], provider: "synthetic", id: "small" },
+			]);
 		});
 	});
 });
