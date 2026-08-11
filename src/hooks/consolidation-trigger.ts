@@ -141,7 +141,7 @@ function workerThinkingLevel(runtime: Runtime, resolved: ResolvedModel) {
 	if (resolved.fallbackUsed === true) {
 		return runtime.config.fallbackModel?.thinking ?? runtime.config.model?.thinking ?? "low";
 	}
-	return runtime.config.model?.thinking ?? "low";
+	return resolved.thinking ?? runtime.config.model?.thinking ?? "low";
 }
 
 /**

@@ -30,6 +30,20 @@ export interface ConfiguredModel {
  */
 export type CompactAfterTokensMode = "calibrated" | "ratio";
 
+/**
+ * A glob-matched routing rule for the memory-worker model.
+ *
+ * `match` is a glob (`*` and `?` wildcards) tested against the active session
+ * model's `"<provider>/<id>"` key. The first entry in `modelMap` whose
+ * `match` matches wins; if none match, `model` (or the session model) is used.
+ */
+export interface ModelMapEntry {
+	match: string;
+	provider: string;
+	id: string;
+	thinking?: ModelThinkingLevel;
+}
+
 export interface Config {
 	observeAfterTokens: number;
 	reflectAfterTokens: number;
@@ -70,6 +84,7 @@ export interface Config {
 	 */
 	fallbackModel?: ConfiguredModel;
 	showWorkerNotifications: boolean;
+	modelMap: ModelMapEntry[];
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -85,6 +100,7 @@ export const DEFAULTS: Config = {
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
+	modelMap: [],
 	passive: false,
 	debugLog: false,
 };
@@ -203,6 +219,60 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	return model;
 }
 
+function normalizeModelMapEntry(value: unknown): ModelMapEntry | undefined {
+	if (!isRecord(value)) return undefined;
+	const match = nonEmptyString(value.match);
+	const provider = nonEmptyString(value.provider);
+	const id = nonEmptyString(value.id);
+	if (!match || !provider || !id) return undefined;
+	const entry: ModelMapEntry = { match, provider, id };
+	if (isThinkingLevel(value.thinking)) entry.thinking = value.thinking;
+	return entry;
+}
+
+function normalizeModelMap(value: unknown): ModelMapEntry[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const entries = value.map(normalizeModelMapEntry).filter((entry): entry is ModelMapEntry => entry !== undefined);
+	return entries.length > 0 ? entries : undefined;
+}
+
+/**
+ * Translate a `match` glob (`*` = any run of characters, `?` = one character)
+ * into an anchored, case-insensitive RegExp.
+ */
+function globToRegExp(glob: string): RegExp {
+	const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+	return new RegExp(`^${escaped}$`, "i");
+}
+
+/**
+ * Build the `"<provider>/<id>"` key used to match `modelMap` entries against
+ * the active session model. Returns undefined if the model lacks either field.
+ */
+export function activeModelKey(model: unknown): string | undefined {
+	if (!isRecord(model)) return undefined;
+	const provider = nonEmptyString(model.provider);
+	const id = nonEmptyString(model.id);
+	return provider && id ? `${provider}/${id}` : undefined;
+}
+
+/**
+ * Resolve the memory-worker model routing for the given active session model:
+ * the first `modelMap` entry whose `match` glob matches `"<provider>/<id>"`,
+ * falling back to the static `model` config if none match.
+ */
+export function resolveConfiguredModel(config: Config, activeModel: unknown): ConfiguredModel | undefined {
+	const key = activeModelKey(activeModel);
+	if (key) {
+		for (const entry of config.modelMap) {
+			if (globToRegExp(entry.match).test(key)) {
+				return { provider: entry.provider, id: entry.id, thinking: entry.thinking };
+			}
+		}
+	}
+	return config.model;
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -215,6 +285,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;
+	const modelMap = normalizeModelMap(value.modelMap);
+	if (modelMap) normalized.modelMap = modelMap;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;

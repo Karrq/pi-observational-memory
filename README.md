@@ -312,6 +312,23 @@ Set `fallbackModel` when the memory model may be unavailable: it is tried when t
 
 Set `showWorkerNotifications` to `false` to hide routine worker start and completion messages (including deliberate-empty observer info messages). Model fallback/unavailability, worker failures (including observer stream errors), compaction notifications, and explicit `/om:*` command output remain visible.
 
+### Routing the memory-worker model by active session model (local patch)
+
+`modelMap` selects the memory-worker model based on the active session model, matched by glob against `"<provider>/<id>"`. The first matching entry wins; if none match, `model` (or the session model) is used as before.
+
+```json
+{
+  "observational-memory": {
+    "modelMap": [
+      { "match": "claude-bridge/claude-opus-*", "provider": "claude-bridge", "id": "claude-sonnet-5" },
+      { "match": "synthetic/syn:large:*", "provider": "synthetic", "id": "syn:small:text" }
+    ]
+  }
+}
+```
+
+Each entry may also set `thinking`. This is a local patch (`src/config.ts`, `src/runtime.ts`) on top of upstream `master` and is not part of the published package.
+
 `observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max.
 
 Dropper pruning balances age, relevance, and reflection coverage. Relevance is importance/resistance, not a permanent active-memory pin: `critical` observations require the strongest evidence but can be dropped when they are older and safely represented by reflections, superseded by newer memory, redundant, or obsolete. Dropper input annotates each active observation with deterministic coverage evidence: `none`, `partial`, or `strong`; coverage guides model judgment and is not an automatic drop rule. Dropping removes observations from active memory, not ledger history.

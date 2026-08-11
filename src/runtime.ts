@@ -1,4 +1,5 @@
-import { type Config, DEFAULTS, loadConfig } from "./config.js";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { type Config, DEFAULTS, loadConfig, resolveConfiguredModel } from "./config.js";
 import { debugLog } from "./debug-log.js";
 
 export type ResolveResult =
@@ -9,6 +10,7 @@ export type ResolveResult =
 			headers?: Record<string, string>;
 			env?: Record<string, string>;
 			baseUrl?: string;
+			thinking?: ModelThinkingLevel;
 			/** True when this result came from `config.fallbackModel` after the primary failed. */
 			fallbackUsed?: boolean;
 			/** Primary failure reason recorded when `fallbackUsed` is true. */
@@ -164,22 +166,26 @@ export class Runtime {
 		return { ...fallback, fallbackUsed: true, primaryFailure: primary.reason };
 	}
 
-	/** `config.model` when it resolves in Pi's registry, otherwise the session model. */
+	/** The `modelMap` match or `config.model` when it resolves in Pi's registry, otherwise the session model. */
 	private async resolvePrimaryModel(ctx: ResolveCtx): Promise<ResolveResult> {
 		let model = ctx.model;
-		if (this.config.model) {
-			const configured = ctx.modelRegistry.find(this.config.model.provider, this.config.model.id);
-			if (configured) {
-				model = configured;
+		const configured = resolveConfiguredModel(this.config, ctx.model);
+		let thinking = configured?.thinking;
+		if (configured) {
+			const found = ctx.modelRegistry.find(configured.provider, configured.id);
+			if (found) {
+				model = found;
 			} else if (ctx.hasUI && ctx.ui) {
 				ctx.ui.notify(
-					`Observational memory: configured model ${this.config.model.provider}/${this.config.model.id} not found, using session model`,
+					`Observational memory: configured model ${configured.provider}/${configured.id} not found, using session model`,
 					"warning",
 				);
+				thinking = undefined;
 			}
 		}
 		if (!model) return { ok: false, reason: "no model available (session has no model and no observational-memory model configured)" };
-		return this.resolveCandidate(ctx, model);
+		const result = await this.resolveCandidate(ctx, model);
+		return result.ok ? { ...result, thinking } : result;
 	}
 
 	/**
@@ -195,7 +201,7 @@ export class Runtime {
 		// re-run the exact failure instead of adding a second chance. The effective
 		// primary is the configured model when it resolves, else the session model,
 		// matching `resolvePrimaryModel`.
-		const configured = this.config.model;
+		const configured = resolveConfiguredModel(this.config, ctx.model);
 		const configuredResolved = configured
 			? (ctx.modelRegistry.find(configured.provider, configured.id) as { provider?: string; id?: string } | undefined)
 			: undefined;
