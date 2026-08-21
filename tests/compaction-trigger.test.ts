@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerCompactionTrigger } from "../src/hooks/compaction-trigger.js";
 import { compactionEntry, rawMessage, textCustomMessage, type TestEntry } from "./fixtures/session.js";
 
-function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensMode?: "calibrated" | "ratio"; compactAfterTokensRatio?: number; passive?: boolean; compactInFlight?: boolean } = {}) {
+function captureHandler(args: { compactAfterTokens?: number | { type: "ratio"; value: number }; passive?: boolean; compactInFlight?: boolean } = {}) {
 	let handler: ((event: unknown, ctx: unknown) => void) | undefined;
 	const pi = {
 		on: vi.fn((name: string, cb: typeof handler) => {
@@ -15,8 +15,6 @@ function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensM
 		ensureConfig: vi.fn(),
 		config: {
 			compactAfterTokens: args.compactAfterTokens ?? 3,
-			compactAfterTokensMode: args.compactAfterTokensMode ?? "calibrated",
-			compactAfterTokensRatio: args.compactAfterTokensRatio ?? 0.68,
 			passive: args.passive ?? false,
 		},
 		compactInFlight: args.compactInFlight ?? false,
@@ -333,8 +331,7 @@ describe("V3 compaction trigger", () => {
 			// 3 tokens raw; ratio 0.5 of 4-token window = 2 -> threshold 2, so 3 >= 2 fires.
 			const { handler } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([dueBranch], { model: { contextWindow: 4 } });
 
@@ -348,8 +345,7 @@ describe("V3 compaction trigger", () => {
 			// 1 token raw (belowBranch); ratio 0.5 of 4 = 2 -> threshold 2, so 1 < 2 does not fire.
 			const { handler } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([belowBranch], { model: { contextWindow: 4 } });
 
@@ -362,8 +358,7 @@ describe("V3 compaction trigger", () => {
 		it("uses the model context window in ratio mode", async () => {
 			const { handler } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([dueBranch], {
 				model: { contextWindow: 4 },
@@ -380,8 +375,7 @@ describe("V3 compaction trigger", () => {
 			// ratio mode but no model -> falls back to compactAfterTokens=81000, so 3 tokens won't fire.
 			const { handler } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([dueBranch], { model: undefined });
 
@@ -394,8 +388,7 @@ describe("V3 compaction trigger", () => {
 		it("falls back to calibrated value when contextWindow is zero", async () => {
 			const { handler } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([dueBranch], { model: { contextWindow: 0 } });
 
@@ -410,8 +403,7 @@ describe("V3 compaction trigger", () => {
 			// second branch has 1 (< 2) -> skipped because another compaction reduced pressure.
 			const { handler, runtime } = captureHandler({
 				compactAfterTokens: 81000,
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 			const ctx = fakeCtx([dueBranch, belowBranch], {
 				model: { contextWindow: 4 },

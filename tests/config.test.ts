@@ -39,8 +39,6 @@ describe("V3 config", () => {
 			observeAfterTokens: 10000,
 			reflectAfterTokens: 20000,
 			compactAfterTokens: 81000,
-			compactAfterTokensMode: "calibrated",
-			compactAfterTokensRatio: 0.68,
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
 			agentMaxTurns: 16,
@@ -206,8 +204,20 @@ describe("V3 config", () => {
 		expect(readEnvConfig({ PI_OBSERVATIONAL_MEMORY_PASSIVE: "maybe" })).toEqual({});
 	});
 
-	describe("compactAfterTokens ratio mode", () => {
-		it("accepts compactAfterTokensMode and compactAfterTokensRatio", () => {
+	describe("threshold object form", () => {
+		it("accepts the object form for compactAfterTokens", () => {
+			writeJson(join(cwd, ".pi", "settings.json"), {
+				"observational-memory": {
+					compactAfterTokens: { type: "ratio", value: 0.5 },
+				},
+			});
+
+			expect(loadConfig(cwd, {})).toMatchObject({
+				compactAfterTokens: { type: "ratio", value: 0.5 },
+			});
+		});
+
+		it("maps legacy flat ratio keys onto the object form", () => {
 			writeJson(join(cwd, ".pi", "settings.json"), {
 				"observational-memory": {
 					compactAfterTokensMode: "ratio",
@@ -216,87 +226,73 @@ describe("V3 config", () => {
 			});
 
 			expect(loadConfig(cwd, {})).toMatchObject({
-				compactAfterTokensMode: "ratio",
-				compactAfterTokensRatio: 0.5,
+				compactAfterTokens: { type: "ratio", value: 0.5 },
 			});
 		});
 
-		it("rejects invalid mode values and falls back to default calibrated", () => {
+		it("legacy ratio keys win over a plain-number compactAfterTokens", () => {
 			writeJson(join(cwd, ".pi", "settings.json"), {
 				"observational-memory": {
-					compactAfterTokensMode: "auto",
+					compactAfterTokens: 81000,
+					compactAfterTokensMode: "ratio",
+					compactAfterTokensRatio: 0.5,
 				},
 			});
 
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensMode: "calibrated" });
+			expect(loadConfig(cwd, {})).toMatchObject({
+				compactAfterTokens: { type: "ratio", value: 0.5 },
+			});
 		});
 
-		it("rejects ratio outside (0, 1) and falls back to default", () => {
-			writeJson(join(cwd, ".pi", "settings.json"), {
-				"observational-memory": {
-					compactAfterTokensRatio: 0,
-				},
-			});
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensRatio: 0.68 });
-
-			writeJson(join(cwd, ".pi", "settings.json"), {
-				"observational-memory": {
-					compactAfterTokensRatio: 1,
-				},
-			});
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensRatio: 0.68 });
-
-			writeJson(join(cwd, ".pi", "settings.json"), {
-				"observational-memory": {
-					compactAfterTokensRatio: 1.5,
-				},
-			});
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensRatio: 0.68 });
-
-			writeJson(join(cwd, ".pi", "settings.json"), {
-				"observational-memory": {
-					compactAfterTokensRatio: -0.2,
-				},
-			});
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensRatio: 0.68 });
-		});
-
-		it("rejects non-numeric ratio and falls back to default", () => {
-			writeJson(join(cwd, ".pi", "settings.json"), {
-				"observational-memory": {
-					compactAfterTokensRatio: "0.5",
-				},
-			});
-			expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokensRatio: 0.68 });
+		it("rejects invalid threshold objects and falls back to defaults", () => {
+			const invalid = [
+				{ type: "auto", value: 0.5 },
+				{ type: "ratio", value: 0 },
+				{ type: "ratio", value: 1 },
+				{ type: "ratio", value: 1.5 },
+				{ type: "ratio", value: -0.2 },
+				{ type: "ratio", value: "0.5" },
+				{ type: "calibrated", value: 0 },
+				{ type: "calibrated", value: -1 },
+				{ type: "calibrated", value: "81000" },
+				{},
+				"ratio",
+			];
+			for (const compactAfterTokens of invalid) {
+				writeJson(join(cwd, ".pi", "settings.json"), {
+					"observational-memory": { compactAfterTokens },
+				});
+				expect(loadConfig(cwd, {})).toMatchObject({ compactAfterTokens: 81000 });
+			}
 		});
 	});
 
 	describe("resolveCompactAfterTokens", () => {
-		it("returns the calibrated value in calibrated mode", () => {
-			const config = { ...DEFAULTS, compactAfterTokensMode: "calibrated", compactAfterTokens: 81000 } as any;
+		it("returns the calibrated value in calibrated form", () => {
+			const config = { ...DEFAULTS, compactAfterTokens: { type: "calibrated", value: 81000 } } as any;
 			expect(resolveCompactAfterTokens(config, 1_000_000)).toBe(81000);
 		});
 
-		it("returns calibrated value regardless of context window in calibrated mode", () => {
-			const config = { ...DEFAULTS, compactAfterTokensMode: "calibrated", compactAfterTokens: 81000 } as any;
+		it("returns calibrated value regardless of context window in calibrated form", () => {
+			const config = { ...DEFAULTS, compactAfterTokens: { type: "calibrated", value: 81000 } } as any;
 			expect(resolveCompactAfterTokens(config, undefined)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, 0)).toBe(81000);
 		});
 
-		it("scales by context window in ratio mode", () => {
-			const config = { ...DEFAULTS, compactAfterTokensMode: "ratio", compactAfterTokensRatio: 0.5, compactAfterTokens: 81000 } as any;
+		it("scales by context window in ratio form", () => {
+			const config = { ...DEFAULTS, compactAfterTokens: { type: "ratio", value: 0.5 } } as any;
 			expect(resolveCompactAfterTokens(config, 1_000_000)).toBe(500_000);
 			expect(resolveCompactAfterTokens(config, 200_000)).toBe(100_000);
 		});
 
 		it("floors fractional results to an integer >= 1", () => {
-			const config = { ...DEFAULTS, compactAfterTokensMode: "ratio", compactAfterTokensRatio: 0.5, compactAfterTokens: 81000 } as any;
+			const config = { ...DEFAULTS, compactAfterTokens: { type: "ratio", value: 0.5 } } as any;
 			expect(resolveCompactAfterTokens(config, 3)).toBe(1);
 			expect(resolveCompactAfterTokens(config, 1)).toBe(1);
 		});
 
-		it("falls back to calibrated value when context window is unavailable in ratio mode", () => {
-			const config = { ...DEFAULTS, compactAfterTokensMode: "ratio", compactAfterTokensRatio: 0.5, compactAfterTokens: 81000 } as any;
+		it("falls back to the default token value when context window is unavailable in ratio form", () => {
+			const config = { ...DEFAULTS, compactAfterTokens: { type: "ratio", value: 0.5 } } as any;
 			expect(resolveCompactAfterTokens(config, undefined)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, 0)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, -1)).toBe(81000);

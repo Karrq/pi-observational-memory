@@ -10,38 +10,49 @@ export interface ConfiguredModel {
 }
 
 /**
- * How `compactAfterTokens` is interpreted.
+ * The two ways a token threshold can be expressed.
  *
- * - `"calibrated"` (default): use the static `compactAfterTokens` value directly.
+ * - `"calibrated"` (default): use the static token value directly.
  *   Backwards-compatible with all existing V3 configs.
  *
  * - `"ratio"`: compute the effective threshold as
- *   `floor(model.contextWindow * compactAfterTokensRatio)`. This auto-scales the
- *   proactive compaction trigger to the active model's context window, so a 1M
- *   context model is not preempted at the same 81K threshold as a 128K model.
+ *   `floor(model.contextWindow * value)`. This auto-scales the trigger to the
+ *   active model's context window, so a 1M context model is not preempted at
+ *   the same absolute threshold as a 128K model.
  *
  *   Some models advertise a large context window but lose attention at long
- *   range; users can lower `compactAfterTokensRatio` to compact earlier on such
- *   models without giving up the window on models that stay sharp.
+ *   range; users can lower the ratio to fire earlier on such models without
+ *   giving up the window on models that stay sharp.
  *
  *   When the active model's `contextWindow` is unavailable (undefined, 0, or
- *   negative), ratio mode falls back to the calibrated `compactAfterTokens`
- *   value so compaction still triggers safely.
+ *   negative), ratio mode falls back to the corresponding default token value
+ *   so the trigger still fires safely.
+ *
+ * The union is deliberately discriminated on `type` so adding a new strategy
+ * is a compile-time exhaustive check at every `switch` over it.
  */
-export type CompactAfterTokensMode = "calibrated" | "ratio";
+export type TokenThresholdType = "calibrated" | "ratio";
+
+export type TokenThreshold =
+	| { type: "calibrated"; value: number }
+	| { type: "ratio"; value: number };
+
+/** Legacy flat settings keys, still parsed for backwards compatibility. */
+export interface LegacyCompactThresholdSettings {
+	compactAfterTokensMode?: TokenThresholdType;
+	compactAfterTokensRatio?: number;
+}
 
 export interface Config {
-	observeAfterTokens: number;
-	reflectAfterTokens: number;
+	observeAfterTokens: number | TokenThreshold;
+	reflectAfterTokens: number | TokenThreshold;
 	/**
 	 * Maximum estimated source tokens serialized into a single observer chunk.
 	 * Unset (default) derives the cap from the resolved memory model's context
 	 * window; see {@link resolveObserverChunkMaxTokens}.
 	 */
 	observerChunkMaxTokens?: number;
-	compactAfterTokens: number;
-	compactAfterTokensMode: CompactAfterTokensMode;
-	compactAfterTokensRatio: number;
+	compactAfterTokens: number | TokenThreshold;
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
 	agentMaxTurns: number;
@@ -74,12 +85,20 @@ export interface Config {
 	debugLog: boolean;
 }
 
-export const DEFAULTS: Config = {
+/**
+ * Numeric fallbacks used when a `"ratio"` threshold cannot be resolved against
+ * a model context window. Also the source of the plain-number defaults.
+ */
+const THRESHOLD_FALLBACKS = {
 	observeAfterTokens: 10_000,
 	reflectAfterTokens: 20_000,
 	compactAfterTokens: 81_000,
-	compactAfterTokensMode: "calibrated",
-	compactAfterTokensRatio: 0.68,
+} as const;
+
+export const DEFAULTS: Config = {
+	observeAfterTokens: THRESHOLD_FALLBACKS.observeAfterTokens,
+	reflectAfterTokens: THRESHOLD_FALLBACKS.reflectAfterTokens,
+	compactAfterTokens: THRESHOLD_FALLBACKS.compactAfterTokens,
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
 	agentMaxTurns: 16,
@@ -89,23 +108,66 @@ export const DEFAULTS: Config = {
 	debugLog: false,
 };
 
-export const COMPACT_AFTER_TOKENS_MODE_VALUES: readonly CompactAfterTokensMode[] = ["calibrated", "ratio"] as const;
+export const TOKEN_THRESHOLD_TYPE_VALUES: readonly TokenThresholdType[] = ["calibrated", "ratio"] as const;
+
+function isTokenThresholdType(value: unknown): value is TokenThresholdType {
+	return typeof value === "string" && (TOKEN_THRESHOLD_TYPE_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Resolve a threshold spec against the active model's context window.
+ *
+ * Plain numbers pass through unchanged. In `"calibrated"` form the value is
+ * used directly; in `"ratio"` form it is `floor(contextWindow * value)`
+ * (clamped to a minimum of 1) when `contextWindow` is a positive number, and
+ * `fallback` otherwise. Exhaustive over the {@link TokenThreshold} union:
+ * adding a variant fails to compile here until handled.
+ */
+export function resolveTokenThreshold(
+	spec: number | TokenThreshold,
+	contextWindow: number | undefined,
+	fallback: number,
+): number {
+	if (typeof spec === "number") return spec;
+	switch (spec.type) {
+		case "calibrated":
+			return spec.value;
+		case "ratio":
+			if (typeof contextWindow === "number" && contextWindow > 0) {
+				return Math.max(1, Math.floor(contextWindow * spec.value));
+			}
+			return fallback;
+	}
+}
+
+function resolveConfigThreshold(
+	spec: number | TokenThreshold,
+	contextWindow: number | undefined,
+	defaultFallback: number,
+): number {
+	const fallback = typeof spec === "number" ? spec : defaultFallback;
+	return resolveTokenThreshold(spec, contextWindow, fallback);
+}
+
+/** Effective observation-run threshold for the given config and model window. */
+export function resolveObserveAfterTokens(config: Config, contextWindow: number | undefined): number {
+	return resolveConfigThreshold(config.observeAfterTokens, contextWindow, THRESHOLD_FALLBACKS.observeAfterTokens);
+}
+
+/** Effective reflection-run threshold for the given config and model window. */
+export function resolveReflectAfterTokens(config: Config, contextWindow: number | undefined): number {
+	return resolveConfigThreshold(config.reflectAfterTokens, contextWindow, THRESHOLD_FALLBACKS.reflectAfterTokens);
+}
 
 /**
  * Resolve the effective proactive-compaction token threshold for the given
  * config and active model context window.
  *
- * In `"calibrated"` mode this is always `config.compactAfterTokens`.
- *
- * In `"ratio"` mode this is `floor(contextWindow * compactAfterTokensRatio)`
- * (clamped to a minimum of 1) when `contextWindow` is a positive number, and
- * falls back to `config.compactAfterTokens` otherwise.
+ * See {@link resolveTokenThreshold}; falls back to the default
+ * `compactAfterTokens` when a ratio cannot be resolved against a window.
  */
 export function resolveCompactAfterTokens(config: Config, contextWindow: number | undefined): number {
-	if (config.compactAfterTokensMode === "ratio" && typeof contextWindow === "number" && contextWindow > 0) {
-		return Math.max(1, Math.floor(contextWindow * config.compactAfterTokensRatio));
-	}
-	return config.compactAfterTokens;
+	return resolveConfigThreshold(config.compactAfterTokens, contextWindow, THRESHOLD_FALLBACKS.compactAfterTokens);
 }
 
 export const THINKING_LEVEL_VALUES: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -172,9 +234,6 @@ function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVEL_VALUES as readonly string[]).includes(value);
 }
 
-function isCompactAfterTokensMode(value: unknown): value is CompactAfterTokensMode {
-	return typeof value === "string" && (COMPACT_AFTER_TOKENS_MODE_VALUES as readonly string[]).includes(value);
-}
 
 /**
  * A valid ratio is a finite number strictly between 0 and 1.
@@ -183,6 +242,25 @@ function isCompactAfterTokensMode(value: unknown): value is CompactAfterTokensMo
  */
 function validRatioOrUndefined(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 && value < 1 ? value : undefined;
+}
+
+/**
+ * Parse a threshold setting: a plain positive-integer token count, or an
+ * object form where `value` must be a positive integer in `"calibrated"`
+ * form and a finite ratio in (0, 1) in `"ratio"` form. Anything else yields
+ * undefined so callers can reject or ignore the setting.
+ */
+export function parseTokenThreshold(value: unknown): number | TokenThreshold | undefined {
+	const plain = positiveIntegerOrUndefined(value);
+	if (plain !== undefined) return plain;
+	if (!isRecord(value)) return undefined;
+	if (!isTokenThresholdType(value.type)) return undefined;
+	if (value.type === "ratio") {
+		const ratio = validRatioOrUndefined(value.value);
+		return ratio !== undefined ? { type: "ratio", value: ratio } : undefined;
+	}
+	const tokens = positiveIntegerOrUndefined(value.value);
+	return tokens !== undefined ? { type: "calibrated", value: tokens } : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -206,24 +284,38 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
-		"observeAfterTokens",
-		"reflectAfterTokens",
 		"observerChunkMaxTokens",
-		"compactAfterTokens",
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;
+	const thresholdKeys = [
+		"observeAfterTokens",
+		"reflectAfterTokens",
+		"compactAfterTokens",
+	] as const;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
 	}
-	if (isCompactAfterTokensMode(value.compactAfterTokensMode)) {
-		normalized.compactAfterTokensMode = value.compactAfterTokensMode;
+	for (const key of thresholdKeys) {
+		const normalizedValue = parseTokenThreshold(value[key]);
+		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
 	}
-	const ratio = validRatioOrUndefined(value.compactAfterTokensRatio);
-	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
+	// Legacy flat keys (`compactAfterTokensMode` + `compactAfterTokensRatio`)
+	// map onto the object form. In legacy semantics the ratio applied whenever
+	// the mode said so, even alongside a plain-number `compactAfterTokens`
+	// (which served only as the no-window fallback), so only a new-form object
+	// takes precedence over it.
+	const legacyRatio = validRatioOrUndefined(value.compactAfterTokensRatio);
+	if (
+		value.compactAfterTokensMode === "ratio"
+		&& legacyRatio !== undefined
+		&& !isRecord(value.compactAfterTokens)
+	) {
+		normalized.compactAfterTokens = { type: "ratio", value: legacyRatio };
+	}
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;

@@ -209,9 +209,7 @@ A typical config:
   "observational-memory": {
     "observeAfterTokens": 10000,
     "reflectAfterTokens": 20000,
-    "compactAfterTokens": 81000,
-    "compactAfterTokensMode": "calibrated",
-    "compactAfterTokensRatio": 0.68,
+    "compactAfterTokens": { "type": "calibrated", "value": 81000 },
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 16,
@@ -236,56 +234,69 @@ Most users can start with the defaults and tune only if they have a specific rea
 
 If your memory model is a local llama.cpp server, size `agentMaxTokens` so that a worst-case request (observer chunk + prior memory + system prompt + the full response budget) fits inside the server's context: slot KV is shared between the main session's retained cache and concurrent sub-agent requests, so an over-budget sub-agent request fails with `500 "Context size has been exceeded."` and the affected memory run aborts. For example, on a 64K-slot server, pairing `"agentMaxTokens": 8192` with a low `observerChunkMaxTokens` keeps sub-agent requests well inside the window.
 
-### Scaling compaction to the model's context window
+### Token thresholds: plain numbers or `{ type, value }` objects
 
-By default `compactAfterTokensMode` is `"calibrated"`, so the proactive
-compaction trigger uses the fixed `compactAfterTokens` estimated source-entry
-threshold (81,000 by default). This preserves the pre-PR #40 compaction metric
-for typical ~128K–200K context models.
+`observeAfterTokens`, `reflectAfterTokens`, and `compactAfterTokens` each accept
+either a plain positive-integer token count or a threshold object:
+
+```json
+{ "type": "calibrated", "value": 81000 }
+```
+
+```json
+{ "type": "ratio", "value": 0.68 }
+```
+
+A plain number is shorthand for the `"calibrated"` object form.
+
+### Scaling thresholds to the model's context window
+
+By default thresholds are calibrated: the trigger uses the fixed token value
+(`compactAfterTokens` is 81,000 by default). This preserves the pre-PR #40
+compaction metric for typical ~128K–200K context models.
 
 On a large-context model (e.g. 1M tokens) the calibrated default preempts
-compaction at ~81K, wasting most of the window. Switch to `"ratio"` mode to let
-the trigger scale with the active model's `contextWindow`:
+compaction at ~81K, wasting most of the window. Switch to ratio form to let the
+trigger scale with the active model's `contextWindow`:
 
 ```json
 {
   "observational-memory": {
-    "compactAfterTokens": 81000,
-    "compactAfterTokensMode": "ratio",
-    "compactAfterTokensRatio": 0.5
+    "compactAfterTokens": { "type": "ratio", "value": 0.5 }
   }
 }
 ```
 
-In ratio mode the effective threshold is
-`floor(model.contextWindow * compactAfterTokensRatio)` (clamped to a minimum of
-1). With the example above, a 1,000,000-token window compacts after about
-500,000 estimated source-entry tokens after the latest compaction boundary; a
-200,000-token window uses about 100,000. The threshold counts source entries,
-not Pi's system prompt, tool schemas, or provider accounting. Pi's native
-window-pressure compaction remains independent.
+In ratio form the effective threshold is
+`floor(model.contextWindow * value)` (clamped to a minimum of 1). With the
+example above, a 1,000,000-token window compacts after about 500,000 estimated
+source-entry tokens after the latest compaction boundary; a 200,000-token
+window uses about 100,000. The threshold counts source entries, not Pi's system
+prompt, tool schemas, or provider accounting. Pi's native window-pressure
+compaction remains independent.
 
-`compactAfterTokensRatio` is user-tunable precisely because **context window ≠
-attention**. Some models advertise a large window but degrade at long range; set
-a lower ratio (e.g. `0.4`) to compact earlier on those, or a higher ratio
-(e.g. `0.7`) on models that stay sharp. The default ratio is `0.68`.
+The ratio is user-tunable precisely because **context window ≠ attention**. Some
+models advertise a large window but degrade at long range; set a lower ratio
+(e.g. `0.4`) to compact earlier on those, or a higher ratio (e.g. `0.7`) on
+models that stay sharp.
 
-`compactAfterTokens` is always retained as the fallback: in `"calibrated"`
-mode it is the threshold directly, and in `"ratio"` mode it is used whenever
-the active model's `contextWindow` is unavailable (undefined, 0, or negative),
-so compaction still triggers safely. `/om:status` shows the resolved threshold
-on the `Next compaction` line regardless of mode.
+In ratio form, when the active model's `contextWindow` is unavailable (undefined,
+0, or negative), the threshold falls back to its built-in default token value
+(10,000 observe / 20,000 reflect / 81,000 compact) so the trigger still fires
+safely. `/om:status` shows the resolved threshold for all three triggers
+regardless of form.
+
+Legacy flat keys (`compactAfterTokensMode` + `compactAfterTokensRatio`) are
+still parsed and map onto the ratio object form.
 
 ### Defaults
 
 | Setting                     | Default       | Meaning                                                                                           |
 | --------------------------- | ------------- | ------------------------------------------------------------------------------------------------- |
-| `observeAfterTokens`        | `10000`       | Raw/source token threshold for observation runs.                                                  |
+| `observeAfterTokens`        | `10000`       | Raw/source token threshold for observation runs. Accepts a number or `{ type, value }` threshold object (see above). |
 | `observerChunkMaxTokens`    | derived       | Max estimated tokens serialized into one observer chunk (minimum `256`). Unset: `floor(contextWindow * 0.2)` of the resolved memory model, or `60000` when the window is unknown. Larger backlogs drain oldest-first; a single over-budget source is sent as a marked head/tail excerpt while the original source remains in the session ledger. |
-| `reflectAfterTokens`        | `20000`       | Raw/source token threshold for reflection runs; successful reflection creates dropper opportunities. |
-| `compactAfterTokens`        | `81000`       | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
-| `compactAfterTokensMode`    | `"calibrated"`| `"calibrated"` uses `compactAfterTokens` directly. `"ratio"` scales the source-entry threshold by the active model's `contextWindow`. |
-| `compactAfterTokensRatio`   | `0.68`        | In `"ratio"` mode, the threshold is `floor(contextWindow * ratio)`. Tunable because large windows do not always mean strong long-range attention. Must be in `(0, 1)`. |
+| `reflectAfterTokens`        | `20000`       | Raw/source token threshold for reflection runs; successful reflection creates dropper opportunities. Accepts a number or threshold object. |
+| `compactAfterTokens`        | `81000`       | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. Accepts a number or threshold object. |
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
 | `agentMaxTurns`             | `16`          | Shared turn cap for background memory-agent loops.                                                |

@@ -203,8 +203,7 @@ describe("V3 /om:status", () => {
 						observeAfterTokens: 10,
 						reflectAfterTokens: 20,
 						compactAfterTokens: 30,
-						compactAfterTokensMode: "ratio",
-						compactAfterTokensRatio: 0.5,
+						compactAfterTokens: { type: "ratio", value: 0.5 },
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
 						passive: false,
@@ -225,8 +224,7 @@ describe("V3 /om:status", () => {
 						observeAfterTokens: 10,
 						reflectAfterTokens: 20,
 						compactAfterTokens: 30,
-						compactAfterTokensMode: "ratio",
-						compactAfterTokensRatio: 0.5,
+						compactAfterTokens: { type: "ratio", value: 0.5 },
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
 						passive: false,
@@ -239,7 +237,7 @@ describe("V3 /om:status", () => {
 			expect(output).toContain("Next compaction:  ~0 / 50,000 estimated source tokens (0%)");
 		});
 
-		it("falls back to calibrated threshold when model is unavailable in ratio mode", async () => {
+		it("falls back to the default threshold when model is unavailable in ratio form", async () => {
 			const output = await setup({
 				entries: [],
 				runtime: {
@@ -247,8 +245,7 @@ describe("V3 /om:status", () => {
 						observeAfterTokens: 10,
 						reflectAfterTokens: 20,
 						compactAfterTokens: 30,
-						compactAfterTokensMode: "ratio",
-						compactAfterTokensRatio: 0.5,
+						compactAfterTokens: { type: "ratio", value: 0.5 },
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
 						passive: false,
@@ -257,10 +254,10 @@ describe("V3 /om:status", () => {
 				model: undefined,
 			}).run();
 
-			expect(output).toContain("Next compaction:  ~0 / 30 estimated source tokens (0%)");
+			expect(output).toContain("Next compaction:  ~0 / 81,000 estimated source tokens (0%)");
 		});
 
-		it("falls back to calibrated threshold when contextWindow is zero in ratio mode", async () => {
+		it("falls back to the default threshold when contextWindow is zero in ratio form", async () => {
 			const output = await setup({
 				entries: [],
 				runtime: {
@@ -268,8 +265,7 @@ describe("V3 /om:status", () => {
 						observeAfterTokens: 10,
 						reflectAfterTokens: 20,
 						compactAfterTokens: 30,
-						compactAfterTokensMode: "ratio",
-						compactAfterTokensRatio: 0.5,
+						compactAfterTokens: { type: "ratio", value: 0.5 },
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
 						passive: false,
@@ -278,7 +274,7 @@ describe("V3 /om:status", () => {
 				model: { contextWindow: 0 },
 			}).run();
 
-			expect(output).toContain("Next compaction:  ~0 / 30 estimated source tokens (0%)");
+			expect(output).toContain("Next compaction:  ~0 / 81,000 estimated source tokens (0%)");
 		});
 	});
 });
