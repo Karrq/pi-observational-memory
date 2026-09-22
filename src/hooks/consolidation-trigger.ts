@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
+import { runSystemOneDropper } from "../agents/dropper/system-one/agent.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
 import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
@@ -741,8 +742,6 @@ async function runDropperStage(
 		`Observational memory: dropper running after reflection — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
 		"info",
 	);
-	const resolved = await resolver.resolve("dropper");
-	if (!resolved) return "abort";
 
 	// Coverage evidence must come from reflections that are still active. An
 	// observation dropped against a reflection tombstoned earlier in this same
@@ -752,19 +751,33 @@ async function runDropperStage(
 		folded.activeReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 		sameRunReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 	);
-	const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
-		model: worker.model as any,
-		apiKey: worker.apiKey,
-		headers: worker.headers,
-		env: worker.env,
-		reflections: reflectionsForDropper,
-		observations: folded.activeObservations,
-		targetTokens: runtime.config.observationsPoolTargetTokens,
-		maxTurns: runtime.config.agentMaxTurns,
-		maxOutputTokens: runtime.config.agentMaxTokens,
-		thinkingLevel: workerThinkingLevel(runtime, worker),
-		modelRegistry: ctx.modelRegistry,
-	}));
+	const systemOne = runtime.config.systemOneDropper;
+	let droppedIds: string[] | undefined;
+	if (systemOne?.enabled) {
+		droppedIds = await runSystemOneDropper({
+			config: systemOne,
+			apiKey: process.env[systemOne.apiKeyEnv],
+			reflections: reflectionsForDropper,
+			observations: folded.activeObservations,
+			targetTokens: runtime.config.observationsPoolTargetTokens,
+		});
+	} else {
+		const resolved = await resolver.resolve("dropper");
+		if (!resolved) return "abort";
+		droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
+			model: worker.model as any,
+			apiKey: worker.apiKey,
+			headers: worker.headers,
+			env: worker.env,
+			reflections: reflectionsForDropper,
+			observations: folded.activeObservations,
+			targetTokens: runtime.config.observationsPoolTargetTokens,
+			maxTurns: runtime.config.agentMaxTurns,
+			maxOutputTokens: runtime.config.agentMaxTokens,
+			thinkingLevel: workerThinkingLevel(runtime, worker),
+			modelRegistry: ctx.modelRegistry,
+		}));
+	}
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, reflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("dropper.append", {

@@ -77,6 +77,15 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `fallbackModel.provider` | string | unset | Provider name in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.id` | string | unset | Model id in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.thinking` | enum | unset; falls back to `model.thinking` then `low` | Optional reasoning/thinking level used when the fallback is active. |
+| `systemOneDropper` | object | unset | Routes the dropper stage to a System One decision endpoint instead of the tool-calling LLM dropper. |
+| `systemOneDropper.enabled` | boolean | `true` when the block is present | Set `false` to keep the block's tuning while falling back to the LLM dropper. |
+| `systemOneDropper.endpoint` | string | `https://api.typesafe.ai` | Base URL; `/v1/systemone` is appended. |
+| `systemOneDropper.model` | string | `jev-latest` | Sent as the request's `model` field. |
+| `systemOneDropper.apiKeyEnv` | string | `TYPESAFE_API_KEY` | Environment variable holding the bearer token. Omitted from the request when unset. |
+| `systemOneDropper.vetoThreshold` | number in [0, 1] | `0.15` | Keep the observation when the preservation-floor probability reaches this. |
+| `systemOneDropper.dropThreshold` | number in [0, 1] | `0.75` | Minimum combined drop probability before an observation becomes a candidate. |
+| `systemOneDropper.maxQuestionsPerRequest` | positive integer | `250` | Questions per request; larger pools fan out across several requests. |
+| `systemOneDropper.requestTimeoutMs` | positive integer | `60000` | Per-request timeout. |
 | `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, reflection dropper, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
@@ -238,6 +247,57 @@ Once the fallback resolves, it is reused for the rest of the consolidation pass,
 If the fallback advertises a smaller context window than the primary, the observer chunk is capped to the smaller window before the run, so a fallback retry is never handed a prompt sized only for a larger primary. `fallbackModel.thinking`, when set, is the thinking level used for the fallback call.
 
 `provider` and `id` must both be non-empty strings, exactly as for `model`. A `fallbackModel` identical to the effective primary memory model — the configured `model` when it resolves, otherwise the session model — is rejected as a misconfiguration. A fallback that also fails leaves the existing skip/fail-safe behavior intact: no memory is invented, coverage does not advance, and the failure is surfaced (worker failure notification, `/om:status`, debug log).
+
+## `systemOneDropper`
+
+Unset by default, which leaves the dropper on the tool-calling LLM path.
+
+The dropper is the one memory stage that generates nothing: it returns a subset of the active observation ids. That makes it a fit for a System One decision model, which evaluates typed questions against a state in a single non-autoregressive pass and returns calibrated probabilities instead of text. Point this at TypeSafe's Jev, or at any server implementing `POST /v1/systemone`, such as a local [open-jev](https://github.com/daseinlabs/open-jev).
+
+```json
+{
+  "observational-memory": {
+    "systemOneDropper": {
+      "endpoint": "https://api.typesafe.ai",
+      "model": "jev-latest",
+      "apiKeyEnv": "TYPESAFE_API_KEY"
+    }
+  }
+}
+```
+
+A local endpoint usually needs no key, so leave `apiKeyEnv` pointing at an unset variable:
+
+```json
+{
+  "observational-memory": {
+    "systemOneDropper": {
+      "endpoint": "http://localhost:8000",
+      "model": "gemma-3-4b-it"
+    }
+  }
+}
+```
+
+### How the decision is made
+
+Each active observation gets five questions, all evaluated against one state carrying the whole pool plus current reflections:
+
+| Signal | Type | Asks |
+| --- | --- | --- |
+| `floor` | noul | Is this the only place carrying a user constraint, concrete completion, identifier, exact error, decision, date, open blocker, or non-standard term? |
+| `redundant` | noul | Is its durable meaning already captured by a reflection with equivalent fidelity? |
+| `superseded` | noul | Does a later observation clearly replace it? |
+| `lowSignal` | noul | Is it a routine acknowledgement or progress update with nothing actionable? |
+| `safety` | score | How safe is it to remove, on a three-level rubric? |
+
+`floor` is a hard veto at `vetoThreshold`. Survivors are scored as `max(redundant, superseded, lowSignal) × safety`, so an observation must both look removable for a concrete reason and be judged safe overall. Anything at or above `dropThreshold` becomes a candidate, ranked by that probability, and then passes through the same budget and coverage/relevance/age tie-breaks the LLM dropper uses. An observation the endpoint did not fully answer is never dropped.
+
+The two thresholds are deliberately asymmetric. Losing a user constraint costs far more than keeping one redundant line, so `vetoThreshold` sits low: a 15% chance an observation uniquely carries something important is enough to keep it. Raise `dropThreshold` if the pool is being pruned too eagerly; raise `vetoThreshold` if it is barely pruned at all.
+
+### Verifying before you trust it
+
+Run with `debugLog` enabled and read `dropper.system_one.result`. It reports `vetoedCount`, `belowThresholdCount`, `missingSignalsCount`, and the ten highest-probability candidates with their per-signal values, so you can see which signal carried each decision before tuning a threshold.
 
 ## `showWorkerNotifications`
 
