@@ -10,7 +10,14 @@ import {
 import { observationPoolMetrics } from "../pool.js";
 import { selectDropCandidates } from "../agent.js";
 import { evaluateSystemOne, type FetchImpl, type SystemOneAnswer, type SystemOneQuestion } from "./client.js";
-import { SIGNAL_KEYS, buildQuestions, buildState, collectSignals, rankCandidates } from "./questions.js";
+import {
+	SIGNAL_KEYS,
+	buildQuestions,
+	buildState,
+	collectSignals,
+	rankCandidates,
+	type ObservationSignals,
+} from "./questions.js";
 
 export interface RunSystemOneDropperArgs {
 	config: SystemOneDropperConfig;
@@ -39,37 +46,21 @@ export function chunkObservations(
 	return chunks;
 }
 
+export interface SystemOneScores {
+	signalsById: Map<string, ObservationSignals>;
+	requestCount: number;
+	inputTokens: number;
+}
+
 /**
- * Dropper stage backed by a System One decision endpoint.
+ * Score every observation without deciding anything.
  *
- * Returns the same contract as the LLM dropper: the ids to drop, or undefined
- * when nothing is safely removable. Ranking happens here, but the final budget
- * and tie-breaks still go through `selectDropCandidates`, so both paths obey
- * the same selection rules.
+ * Split out from `runSystemOneDropper` so shadow mode can collect scores while
+ * the LLM dropper still owns the decision.
  */
-export async function runSystemOneDropper(args: RunSystemOneDropperArgs): Promise<string[] | undefined> {
-	const { config, apiKey, reflections, observations, targetTokens, signal } = args;
-	if (observations.length === 0) return undefined;
-
-	const metrics = observationPoolMetrics(observations, targetTokens);
+export async function scoreObservations(args: RunSystemOneDropperArgs): Promise<SystemOneScores> {
+	const { config, apiKey, reflections, observations, signal } = args;
 	const coverageById = reflectionCoverageMap(observations, reflections);
-	debugLog("dropper.system_one.start", {
-		endpoint: config.endpoint,
-		model: config.model,
-		activeObservationCount: observations.length,
-		reflectionCount: reflections.length,
-		observationTokens: metrics.observationTokens,
-		targetTokens,
-		maxDropsAllowed: metrics.maxDropsAllowed,
-		vetoThreshold: config.vetoThreshold,
-		dropThreshold: config.dropThreshold,
-		coverageSummaryByRelevance: summarizeCoverageByRelevance(observations, coverageById),
-	});
-	if (metrics.maxDropsAllowed <= 0) {
-		debugLog("dropper.system_one.result", { reason: "not_over_target", selectedDropsCount: 0 });
-		return undefined;
-	}
-
 	const state = buildState(observations, reflections, coverageById);
 	const chunks = chunkObservations(observations, config.maxQuestionsPerRequest);
 	const answers: Record<string, SystemOneAnswer> = {};
@@ -100,7 +91,41 @@ export async function runSystemOneDropper(args: RunSystemOneDropperArgs): Promis
 		});
 	}
 
-	const signalsById = collectSignals(answers);
+	return { signalsById: collectSignals(answers), requestCount: chunks.length, inputTokens };
+}
+
+/**
+ * Dropper stage backed by a System One decision endpoint.
+ *
+ * Returns the same contract as the LLM dropper: the ids to drop, or undefined
+ * when nothing is safely removable. Ranking happens here, but the final budget
+ * and tie-breaks still go through `selectDropCandidates`, so both paths obey
+ * the same selection rules.
+ */
+export async function runSystemOneDropper(args: RunSystemOneDropperArgs): Promise<string[] | undefined> {
+	const { config, reflections, observations, targetTokens } = args;
+	if (observations.length === 0) return undefined;
+
+	const metrics = observationPoolMetrics(observations, targetTokens);
+	const coverageById = reflectionCoverageMap(observations, reflections);
+	debugLog("dropper.system_one.start", {
+		endpoint: config.endpoint,
+		model: config.model,
+		activeObservationCount: observations.length,
+		reflectionCount: reflections.length,
+		observationTokens: metrics.observationTokens,
+		targetTokens,
+		maxDropsAllowed: metrics.maxDropsAllowed,
+		vetoThreshold: config.vetoThreshold,
+		dropThreshold: config.dropThreshold,
+		coverageSummaryByRelevance: summarizeCoverageByRelevance(observations, coverageById),
+	});
+	if (metrics.maxDropsAllowed <= 0) {
+		debugLog("dropper.system_one.result", { reason: "not_over_target", selectedDropsCount: 0 });
+		return undefined;
+	}
+
+	const { signalsById, requestCount, inputTokens } = await scoreObservations(args);
 	const ranked = rankCandidates(observations, signalsById, config.vetoThreshold, config.dropThreshold);
 	const droppedIds = selectDropCandidates(
 		ranked.candidates.map((candidate) => candidate.id),
@@ -111,7 +136,7 @@ export async function runSystemOneDropper(args: RunSystemOneDropperArgs): Promis
 
 	debugLog("dropper.system_one.result", {
 		reason: droppedIds.length > 0 ? "selected_nonempty" : "selected_empty",
-		requestCount: chunks.length,
+		requestCount,
 		inputTokens,
 		scoredObservationCount: signalsById.size,
 		missingSignalsCount: ranked.missingSignalsCount,

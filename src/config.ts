@@ -40,8 +40,18 @@ export type CompactAfterTokensMode = "calibrated" | "ratio";
  * a ranked candidate list, which still passes through the same budget and
  * tie-break selection the LLM dropper uses.
  */
+/**
+ * - `off`: the block is inert; the LLM dropper decides.
+ * - `shadow`: the endpoint scores every observation but the LLM dropper still
+ *   decides. Both are written to the drop-score log, which pairs each score
+ *   with the LLM's verdict so a calibration map can be fitted from them.
+ * - `primary`: the endpoint decides.
+ */
+export const SYSTEM_ONE_MODES = ["off", "shadow", "primary"] as const;
+export type SystemOneMode = (typeof SYSTEM_ONE_MODES)[number];
+
 export interface SystemOneDropperConfig {
-	enabled: boolean;
+	mode: SystemOneMode;
 	/** Base URL; `/v1/systemone` is appended. */
 	endpoint: string;
 	model: string;
@@ -64,7 +74,9 @@ export interface SystemOneDropperConfig {
 }
 
 export const SYSTEM_ONE_DROPPER_DEFAULTS: Readonly<SystemOneDropperConfig> = {
-	enabled: true,
+	// Scoring without deciding is the safe default for a newly configured
+	// endpoint: it produces calibration data without changing any drop.
+	mode: "shadow",
 	endpoint: "https://api.typesafe.ai",
 	model: "jev-latest",
 	apiKeyEnv: "TYPESAFE_API_KEY",
@@ -265,8 +277,11 @@ function probabilityOrUndefined(value: unknown): number | undefined {
 export function normalizeSystemOneDropper(value: unknown): SystemOneDropperConfig | undefined {
 	if (!isRecord(value)) return undefined;
 	const endpoint = nonEmptyString(value.endpoint) ?? SYSTEM_ONE_DROPPER_DEFAULTS.endpoint;
+	const mode = (SYSTEM_ONE_MODES as readonly unknown[]).includes(value.mode)
+		? value.mode as SystemOneMode
+		: SYSTEM_ONE_DROPPER_DEFAULTS.mode;
 	return {
-		enabled: value.enabled !== false,
+		mode,
 		endpoint: endpoint.replace(/\/+$/, ""),
 		model: nonEmptyString(value.model) ?? SYSTEM_ONE_DROPPER_DEFAULTS.model,
 		apiKeyEnv: nonEmptyString(value.apiKeyEnv) ?? SYSTEM_ONE_DROPPER_DEFAULTS.apiKeyEnv,

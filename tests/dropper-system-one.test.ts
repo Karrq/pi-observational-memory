@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { SYSTEM_ONE_DROPPER_DEFAULTS, normalizeSystemOneDropper } from "../src/config.js";
 import { evaluateSystemOne, SystemOneError } from "../src/agents/dropper/system-one/client.js";
-import { chunkObservations, runSystemOneDropper } from "../src/agents/dropper/system-one/agent.js";
+import { chunkObservations, runSystemOneDropper, scoreObservations } from "../src/agents/dropper/system-one/agent.js";
 import {
 	SIGNAL_KEYS,
 	buildQuestions,
@@ -54,6 +54,25 @@ describe("system one dropper config", () => {
 		});
 	});
 
+	it("scores every observation without deciding", async () => {
+		const obsA = observation("aaaaaaaaaaaa", { relevance: "medium" });
+		const fetchImpl = vi.fn(async () => jsonResponse({
+			model: "m",
+			answers: answersFor({ aaaaaaaaaaaa: SAFE }),
+		}));
+
+		const result = await scoreObservations({
+			config: { ...SYSTEM_ONE_DROPPER_DEFAULTS, endpoint: "http://localhost:8080" },
+			reflections: [],
+			observations: [obsA],
+			targetTokens: 1,
+			fetchImpl: fetchImpl as any,
+		});
+
+		expect(result.signalsById.get("aaaaaaaaaaaa")?.redundant).toBe(SAFE.redundant);
+		expect(result.requestCount).toBe(1);
+	});
+
 	it("keeps a configured endpoint when a threshold is malformed", () => {
 		const config = normalizeSystemOneDropper({
 			endpoint: "http://localhost:8080",
@@ -66,12 +85,18 @@ describe("system one dropper config", () => {
 		expect(config?.dropThreshold).toBe(SYSTEM_ONE_DROPPER_DEFAULTS.dropThreshold);
 	});
 
-	it("accepts the boundary probabilities and an explicit disable", () => {
+	it("accepts the boundary probabilities", () => {
 		expect(normalizeSystemOneDropper({ vetoThreshold: 0, dropThreshold: 1 })).toMatchObject({
 			vetoThreshold: 0,
 			dropThreshold: 1,
 		});
-		expect(normalizeSystemOneDropper({ enabled: false })?.enabled).toBe(false);
+	});
+
+	it("defaults to shadow so a new endpoint scores without changing any drop", () => {
+		expect(normalizeSystemOneDropper({ endpoint: "http://localhost:8080" })?.mode).toBe("shadow");
+		expect(normalizeSystemOneDropper({ mode: "primary" })?.mode).toBe("primary");
+		expect(normalizeSystemOneDropper({ mode: "off" })?.mode).toBe("off");
+		expect(normalizeSystemOneDropper({ mode: "enabled" })?.mode).toBe("shadow");
 	});
 });
 

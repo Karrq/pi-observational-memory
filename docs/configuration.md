@@ -78,7 +78,7 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `fallbackModel.id` | string | unset | Model id in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.thinking` | enum | unset; falls back to `model.thinking` then `low` | Optional reasoning/thinking level used when the fallback is active. |
 | `systemOneDropper` | object | unset | Routes the dropper stage to a System One decision endpoint instead of the tool-calling LLM dropper. |
-| `systemOneDropper.enabled` | boolean | `true` when the block is present | Set `false` to keep the block's tuning while falling back to the LLM dropper. |
+| `systemOneDropper.mode` | `off` \| `shadow` \| `primary` | `shadow` | `shadow` scores without deciding, `primary` lets the endpoint decide, `off` makes the block inert. |
 | `systemOneDropper.endpoint` | string | `https://api.typesafe.ai` | Base URL; `/v1/systemone` is appended. |
 | `systemOneDropper.model` | string | `jev-latest` | Sent as the request's `model` field. |
 | `systemOneDropper.apiKeyEnv` | string | `TYPESAFE_API_KEY` | Environment variable holding the bearer token. Omitted from the request when unset. |
@@ -252,6 +252,14 @@ If the fallback advertises a smaller context window than the primary, the observ
 
 Unset by default, which leaves the dropper on the tool-calling LLM path.
 
+### Modes
+
+A configured block defaults to `shadow`, which is the mode you want first. The endpoint scores every active observation, the LLM dropper still decides, and both land in the drop-score log. Nothing about which observations get dropped changes, so it is safe to leave on while you gather data. If the endpoint is unreachable, scoring is skipped and the run proceeds normally.
+
+`primary` hands the decision to the endpoint. Move to it once the exported scores show the endpoint agreeing with the LLM dropper often enough to trust.
+
+`off` keeps your endpoint and threshold tuning in the file while falling back entirely to the LLM dropper.
+
 The dropper is the one memory stage that generates nothing: it returns a subset of the active observation ids. That makes it a fit for a System One decision model, which evaluates typed questions against a state in a single non-autoregressive pass and returns calibrated probabilities instead of text. Point this at TypeSafe's Jev, or at any server implementing `POST /v1/systemone`, such as a local [open-jev](https://github.com/daseinlabs/open-jev).
 
 ```json
@@ -298,6 +306,34 @@ The two thresholds are deliberately asymmetric. Losing a user constraint costs f
 ### Verifying before you trust it
 
 Run with `debugLog` enabled and read `dropper.system_one.result`. It reports `vetoedCount`, `belowThresholdCount`, `missingSignalsCount`, and the ten highest-probability candidates with their per-signal values, so you can see which signal carried each decision before tuning a threshold.
+
+### The drop-score log
+
+Whenever the mode is not `off`, every scored observation is appended to:
+
+```txt
+~/.pi/agent/observational-memory/drop-scores/<session-id>.ndjson
+```
+
+This is a data product rather than a diagnostic, so it is written regardless of `debugLog` and is never rotated away. Each row carries the observation id, its relevance and coverage tier, the five signal probabilities, the combined drop probability, what the endpoint would have decided, what the LLM dropper actually decided in shadow mode, and the rank the existing coverage/relevance/age heuristic would have assigned.
+
+Rows are written for the whole pool, including observations the endpoint could not score. A map fitted only on candidates that cleared `dropThreshold` sees one tail of the distribution and comes out wrong in a way that looks fine, so the log deliberately keeps both sides.
+
+Content is not written to this file. `/om:export-drops` rejoins the rows with observation text from the local session file when you are ready to label.
+
+## `/om:export-drops`
+
+```txt
+/om:export-drops [path]
+```
+
+Joins the drop-score log for the current session with the full memory projection and writes JSONL to `om-drop-scores.jsonl`, or to a path you give. Each row adds the observation's text and timestamp, the reflections that cite it, and an empty `label` field.
+
+The command reports how many rows carry an LLM dropper verdict and how often the endpoint agreed, which is the number that tells you whether `primary` mode is worth trying.
+
+The export supports two different jobs. The `llmDecision` field is a distillation label: run in shadow mode for a while and you can fit a calibration map against the LLM dropper's judgement without labelling anything by hand. That caps you at the LLM dropper's quality and inherits its mistakes, so it is a bootstrap rather than ground truth. The empty `label` column is there for when you want to hand-label instead, which is the only way to find cases where both the LLM dropper and the endpoint are wrong together.
+
+The `heuristicRank` field is in every row so you can check something cheaper first: whether `selectDropCandidates`, which already ranks by coverage tier, relevance and age, picks the same drops without any model at all.
 
 ## `showWorkerNotifications`
 

@@ -1,7 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
-import { runSystemOneDropper } from "../agents/dropper/system-one/agent.js";
+import { runSystemOneDropper, scoreObservations } from "../agents/dropper/system-one/agent.js";
+import { dropProbability, type ObservationSignals } from "../agents/dropper/system-one/questions.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
+import { appendDropScores, type DropScoreRow } from "../drop-scores.js";
+import { coverageTierForObservation, reflectionCoverageMap } from "../agents/dropper/coverage.js";
+import { selectDropCandidates } from "../agents/dropper/agent.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
 import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
 import { reflectionPoolMetrics } from "../agents/reflection-dropper/pool.js";
@@ -315,6 +319,73 @@ function debugSessionMetadata(ctx: ConsolidationCtx): { sessionId?: string; sess
 	} catch {
 		return {};
 	}
+}
+
+/**
+ * Write one row per scored observation, pairing the endpoint's signals with the
+ * decision that was actually applied.
+ *
+ * In shadow mode the applied decision is the LLM dropper's, which is the label a
+ * calibration map is fitted against. Rows are also written for observations the
+ * endpoint could not score, so the log records the whole pool rather than only
+ * the candidates, and a map fitted from it sees both tails.
+ */
+function recordDropScores(args: {
+	ctx: ConsolidationCtx;
+	config: NonNullable<Runtime["config"]["systemOneDropper"]>;
+	observations: Observation[];
+	reflections: Reflection[];
+	signalsById: Map<string, ObservationSignals> | undefined;
+	droppedIds: string[] | undefined;
+	llmDecided: boolean;
+}): void {
+	const { ctx, config, observations, reflections, signalsById, droppedIds, llmDecided } = args;
+	if (observations.length === 0) return;
+
+	const coverageById = reflectionCoverageMap(observations, reflections);
+	const dropped = new Set(droppedIds ?? []);
+	// Rank the whole pool by the existing heuristic so the model can be compared
+	// against it later on the same labels.
+	const heuristicOrder = selectDropCandidates(
+		observations.map((observation) => observation.id),
+		observations,
+		observations.length,
+		reflections,
+	);
+	const heuristicRank = new Map(heuristicOrder.map((id, index) => [id, index]));
+	const ts = new Date().toISOString();
+	const { sessionId } = debugSessionMetadata(ctx);
+
+	const rows: DropScoreRow[] = observations.map((observation) => {
+		const signals = signalsById?.get(observation.id);
+		const probability = signals ? dropProbability(signals) : undefined;
+		const systemOneDecision = !signals
+			? "unscored" as const
+			: signals.floor >= config.vetoThreshold
+				? "vetoed" as const
+				: (probability ?? 0) >= config.dropThreshold
+					? "drop" as const
+					: "keep" as const;
+		return {
+			ts,
+			sessionId,
+			observationId: observation.id,
+			relevance: observation.relevance,
+			coverage: coverageTierForObservation(observation, coverageById),
+			...(signals ? { signals, dropProbability: probability } : {}),
+			systemOneDecision,
+			...(llmDecided ? { llmDecision: dropped.has(observation.id) ? "drop" as const : "keep" as const } : {}),
+			heuristicRank: heuristicRank.get(observation.id) ?? observations.length,
+		};
+	});
+
+	const written = appendDropScores(sessionId, rows);
+	debugLog("dropper.scores_recorded", {
+		written,
+		rowCount: rows.length,
+		scoredCount: rows.filter((row) => row.signals !== undefined).length,
+		llmDecided,
+	});
 }
 
 function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
@@ -752,16 +823,30 @@ async function runDropperStage(
 		sameRunReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 	);
 	const systemOne = runtime.config.systemOneDropper;
+	const mode = systemOne?.mode ?? "off";
+	const systemOneArgs = systemOne && {
+		config: systemOne,
+		apiKey: process.env[systemOne.apiKeyEnv],
+		reflections: reflectionsForDropper,
+		observations: folded.activeObservations,
+		targetTokens: runtime.config.observationsPoolTargetTokens,
+	};
+
 	let droppedIds: string[] | undefined;
-	if (systemOne?.enabled) {
-		droppedIds = await runSystemOneDropper({
-			config: systemOne,
-			apiKey: process.env[systemOne.apiKeyEnv],
-			reflections: reflectionsForDropper,
-			observations: folded.activeObservations,
-			targetTokens: runtime.config.observationsPoolTargetTokens,
-		});
+	let signalsById: Map<string, ObservationSignals> | undefined;
+
+	if (systemOne && mode === "primary") {
+		droppedIds = await runSystemOneDropper(systemOneArgs!);
 	} else {
+		// Shadow scoring runs first so a broken endpoint fails before the LLM
+		// dropper spends tokens, and never silently changes which ids are dropped.
+		if (systemOne && mode === "shadow") {
+			try {
+				signalsById = (await scoreObservations(systemOneArgs!)).signalsById;
+			} catch (error) {
+				debugLog("dropper.system_one.shadow_failed", { errorMessage: String(error) });
+			}
+		}
 		const resolved = await resolver.resolve("dropper");
 		if (!resolved) return "abort";
 		droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
@@ -777,6 +862,18 @@ async function runDropperStage(
 			thinkingLevel: workerThinkingLevel(runtime, worker),
 			modelRegistry: ctx.modelRegistry,
 		}));
+	}
+
+	if (systemOne && mode !== "off") {
+		recordDropScores({
+			ctx,
+			config: systemOne,
+			observations: folded.activeObservations,
+			reflections: reflectionsForDropper,
+			signalsById,
+			droppedIds,
+			llmDecided: mode === "shadow",
+		});
 	}
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, reflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
