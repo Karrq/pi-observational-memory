@@ -337,13 +337,15 @@ function recordDropScores(args: {
 	reflections: Reflection[];
 	signalsById: Map<string, ObservationSignals> | undefined;
 	droppedIds: string[] | undefined;
+	proposedIds: readonly string[] | undefined;
 	llmDecided: boolean;
 }): void {
-	const { ctx, config, observations, reflections, signalsById, droppedIds, llmDecided } = args;
+	const { ctx, config, observations, reflections, signalsById, droppedIds, proposedIds, llmDecided } = args;
 	if (observations.length === 0) return;
 
 	const coverageById = reflectionCoverageMap(observations, reflections);
 	const dropped = new Set(droppedIds ?? []);
+	const proposed = proposedIds ? new Set(proposedIds) : undefined;
 	// Rank the whole pool by the existing heuristic so the model can be compared
 	// against it later on the same labels.
 	const heuristicOrder = selectDropCandidates(
@@ -375,6 +377,7 @@ function recordDropScores(args: {
 			...(signals ? { signals, dropProbability: probability } : {}),
 			systemOneDecision,
 			...(llmDecided ? { llmDecision: dropped.has(observation.id) ? "drop" as const : "keep" as const } : {}),
+			...(proposed ? { llmProposed: proposed.has(observation.id) } : {}),
 			heuristicRank: heuristicRank.get(observation.id) ?? observations.length,
 		};
 	});
@@ -833,6 +836,7 @@ async function runDropperStage(
 	};
 
 	let droppedIds: string[] | undefined;
+	let proposedIds: readonly string[] | undefined;
 	let signalsById: Map<string, ObservationSignals> | undefined;
 
 	if (systemOne && mode === "primary") {
@@ -861,6 +865,7 @@ async function runDropperStage(
 			maxOutputTokens: runtime.config.agentMaxTokens,
 			thinkingLevel: workerThinkingLevel(runtime, worker),
 			modelRegistry: ctx.modelRegistry,
+			onProposedIds: (ids) => { proposedIds = ids; },
 		}));
 	}
 
@@ -872,6 +877,7 @@ async function runDropperStage(
 			reflections: reflectionsForDropper,
 			signalsById,
 			droppedIds,
+			proposedIds,
 			llmDecided: mode === "shadow",
 		});
 	}

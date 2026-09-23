@@ -704,6 +704,59 @@ describe("V3 consolidation trigger", () => {
 		expect(rows[0].dropProbability).toBeCloseTo(0.02);
 	});
 
+	it("separates what the LLM proposed from what survived the budget sort", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		// The model asks for both; only the first fits the budget, so the second is
+		// a proposal the sort rejected rather than an observation it wanted kept.
+		mockAgents.runDropper.mockImplementationOnce(async (args: any) => {
+			args.onProposedIds?.(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+			return ["aaaaaaaaaaaa"];
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA, obsB], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		const byId = Object.fromEntries(rows.map((row: any) => [row.observationId, row]));
+		expect(byId["aaaaaaaaaaaa"]).toMatchObject({ llmProposed: true, llmDecision: "drop" });
+		expect(byId["bbbbbbbbbbbb"]).toMatchObject({ llmProposed: true, llmDecision: "keep" });
+	});
+
+	it("omits llmProposed when the dropper never reported a proposal", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		expect(rows[0].llmProposed).toBeUndefined();
+	});
+
 	it("records an unscored row when shadow scoring fails, without blocking the drop", async () => {
 		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
 		mockAgents.runReflector.mockResolvedValueOnce([newRef]);

@@ -35,6 +35,14 @@ export interface DropScoreRow {
 	 */
 	llmDecision?: "drop" | "keep";
 	/**
+	 * Whether the LLM dropper asked for this observation, regardless of whether it
+	 * survived the cut. `llmDecision` is the outcome after `selectDropCandidates`
+	 * applies the budget and sorts by coverage, then relevance, then age, so a
+	 * proposal can be dropped from the set by the sort alone. Recording both
+	 * separates the model's judgement from that ordering.
+	 */
+	llmProposed?: boolean;
+	/**
 	 * Rank the existing coverage/relevance/age heuristic would assign, lowest
 	 * first. Recorded so the model can be compared against the heuristic it is
 	 * meant to improve on, using the same labels.
