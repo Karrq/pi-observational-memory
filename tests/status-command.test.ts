@@ -32,6 +32,7 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 			compactAfterTokens: 30,
 			observationsPoolMaxTokens: 40,
 			observationsPoolTargetTokens: 20,
+			reflectionsPoolTargetTokens: 20,
 			passive: false,
 		},
 		consolidationInFlight: false,
@@ -40,6 +41,7 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 		compactHookInFlight: false,
 		lastObserverError: undefined,
 		lastReflectorError: undefined,
+		lastReflectionDropperError: undefined,
 		lastDropperError: undefined,
 		...args.runtime,
 	};
@@ -66,7 +68,7 @@ describe("V3 /om:status", () => {
 
 		expect(output).toContain("── Memory ──");
 		expect(output).toContain("Observations: 0 recorded / 0 dropped / 0 active / 0 visible");
-		expect(output).toContain("Reflections:  0 recorded / 0 visible");
+		expect(output).toContain("Reflections:  0 recorded / 0 dropped / 0 active / 0 visible");
 		expect(output).toContain("Next observation:");
 		expect(output).toContain("Next compaction:");
 		expect(output).not.toContain("Visible:");
@@ -92,7 +94,7 @@ describe("V3 /om:status", () => {
 		const output = await setup({ entries }).run();
 
 		expect(output).toContain("Observations: 2 recorded / 1 dropped / 1 active / 1 visible +1 -1");
-		expect(output).toContain("Reflections:  1 recorded / 0 visible +1");
+		expect(output).toContain("Reflections:  1 recorded / 0 dropped / 1 active / 0 visible +1");
 		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
 		// Active pool counts the full rendered line (id + timestamp + relevance + content).
 		expect(output).toContain("Active observation pool: ~19 / 20 target tokens (95%)");
@@ -125,7 +127,9 @@ describe("V3 /om:status", () => {
 		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
 		// Active pool counts the full rendered line, unlike the visible pool's stored tokenCount.
 		expect(output).toContain("Active observation pool: ~19 / 20 target tokens (95%)");
-		expect(output).toContain("Reflection pool:         ~3 tokens");
+		expect(output).toContain("Visible reflection pool: ~3 tokens");
+		// Active reflection pool counts the full rendered line (id + content).
+		expect(output).toContain("Active reflection pool:  ~10 / 20 target tokens (50%)");
 		expect(output).not.toContain("Observation pool:");
 		expect(output).not.toContain("Full fold pool:");
 		expect(output).not.toContain("visible observation tokens");
@@ -165,13 +169,14 @@ describe("V3 /om:status", () => {
 		const output = await setup({
 			entries: [],
 			runtime: {
-				config: { observeAfterTokens: 10, reflectAfterTokens: 20, compactAfterTokens: 30, observationsPoolMaxTokens: 40, observationsPoolTargetTokens: 20, passive: true },
+				config: { observeAfterTokens: 10, reflectAfterTokens: 20, compactAfterTokens: 30, observationsPoolMaxTokens: 40, observationsPoolTargetTokens: 20, reflectionsPoolTargetTokens: 20, passive: true },
 				consolidationInFlight: true,
 				consolidationPhase: "reflector",
 				compactInFlight: true,
 				compactHookInFlight: true,
 				lastObserverError: "observer failed",
 				lastReflectorError: "reflect failed",
+				lastReflectionDropperError: "reflection drop failed",
 				lastDropperError: "drop failed",
 			},
 		}).run();
@@ -184,6 +189,7 @@ describe("V3 /om:status", () => {
 		expect(output).toContain("Compaction hook: running");
 		expect(output).toContain("Observer: observer failed");
 		expect(output).toContain("Reflector: reflect failed");
+		expect(output).toContain("Reflection dropper: reflection drop failed");
 		expect(output).toContain("Dropper: drop failed");
 	});
 
@@ -207,6 +213,7 @@ describe("V3 /om:status", () => {
 						compactAfterTokensRatio: 0.5,
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
+						reflectionsPoolTargetTokens: 20,
 						passive: false,
 					},
 				},
@@ -229,6 +236,7 @@ describe("V3 /om:status", () => {
 						compactAfterTokensRatio: 0.5,
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
+						reflectionsPoolTargetTokens: 20,
 						passive: false,
 					},
 				},
@@ -251,6 +259,7 @@ describe("V3 /om:status", () => {
 						compactAfterTokensRatio: 0.5,
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
+						reflectionsPoolTargetTokens: 20,
 						passive: false,
 					},
 				},
@@ -272,6 +281,7 @@ describe("V3 /om:status", () => {
 						compactAfterTokensRatio: 0.5,
 						observationsPoolMaxTokens: 40,
 						observationsPoolTargetTokens: 20,
+						reflectionsPoolTargetTokens: 20,
 						passive: false,
 					},
 				},

@@ -26,7 +26,10 @@ type RecallObservationToolStatus =
 	| "source_unavailable";
 
 type ObservationDetails = Pick<Observation, "id" | "content" | "timestamp" | "relevance"> & { status?: "active" | "dropped" };
-type ReflectionDetails = Pick<Reflection, "id" | "content" | "supportingObservationIds"> & { reflectionIndex: number };
+type ReflectionDetails = Pick<Reflection, "id" | "content" | "supportingObservationIds"> & {
+	reflectionIndex: number;
+	status?: "active" | "dropped";
+};
 
 export type RecallSourceEntryDetails = {
 	id: string;
@@ -145,8 +148,8 @@ function observationDetails(observation: Observation, status?: "active" | "dropp
 	return { id: observation.id, content: observation.content, timestamp: observation.timestamp, relevance: observation.relevance, ...(status ? { status } : {}) };
 }
 
-function reflectionDetails(reflection: Reflection, reflectionIndex: number): ReflectionDetails {
-	return { id: reflection.id, content: reflection.content, supportingObservationIds: reflection.supportingObservationIds, reflectionIndex };
+function reflectionDetails(reflection: Reflection, reflectionIndex: number, status?: "active" | "dropped"): ReflectionDetails {
+	return { id: reflection.id, content: reflection.content, supportingObservationIds: reflection.supportingObservationIds, reflectionIndex, ...(status ? { status } : {}) };
 }
 
 function observationMatchDetails(match: RecalledObservation, includeSourceContent = true): RecallObservationMatchDetails {
@@ -207,7 +210,8 @@ function friendlySourceUnavailableMessage(match: RecallObservationMatchDetails):
 }
 
 function reflectionLineText(reflection: ReflectionDetails): string {
-	return `[${reflection.id}] ${reflection.content}`;
+	const status = reflection.status === "dropped" ? " [dropped]" : "";
+	return `[${reflection.id}]${status} ${reflection.content}`;
 }
 
 function observationLineText(observation: ObservationDetails): string {
@@ -245,7 +249,10 @@ function unavailableSupportingLineText(item: RecallUnavailableSupportingObservat
 function renderMemoryText(result: Extract<RecallResult, { status: "found" }>): string {
 	const sections: string[] = [];
 	if (result.collision) sections.push(`Memory id ${result.memoryId} matched multiple observations/reflections; returning all available evidence from the current branch.`);
-	if (result.reflections.length > 0) sections.push(`Reflections:\n${result.reflections.map((match) => reflectionLineText(reflectionDetails(match.reflection, match.reflectionRecordIndex))).join("\n")}`);
+	for (const match of result.reflections) {
+		if (match.status === "dropped") sections.push(`Reflection ${match.reflection.id} is dropped from active memory but remains recallable.`);
+	}
+	if (result.reflections.length > 0) sections.push(`Reflections:\n${result.reflections.map((match) => reflectionLineText(reflectionDetails(match.reflection, match.reflectionRecordIndex, match.status))).join("\n")}`);
 	if (result.observations.length > 0) sections.push(`Observations:\n${result.observations.map((match) => observationLineText(observationDetails(match.observation, match.status))).join("\n")}`);
 	if (result.missingSupportingObservationIds.length > 0) sections.push(`Unavailable supporting observations:\n${result.missingSupportingObservationIds.map((id) => unavailableSupportingLineText({ observationId: id })).join("\n")}`);
 	if (result.missingSourceEntryIds.length > 0 || result.nonSourceEntryIds.length > 0) {
@@ -261,7 +268,7 @@ function renderMemoryText(result: Extract<RecallResult, { status: "found" }>): s
 }
 
 function resultDetails(result: Extract<RecallResult, { status: "found" }>, includeSourceContent = true): RecallObservationToolDetails {
-	const reflections = result.reflections.map((match) => reflectionDetails(match.reflection, match.reflectionRecordIndex));
+	const reflections = result.reflections.map((match) => reflectionDetails(match.reflection, match.reflectionRecordIndex, match.status));
 	const observations = result.observations.map((match) => observationMatchDetails(match, includeSourceContent));
 	const directMatches = directObservationMatches(result).map((match) => observationMatchDetails(match, includeSourceContent));
 	const sourceEntries = result.sourceEntries.map((entry) => sourceEntryDetails(entry, includeSourceContent));
@@ -355,7 +362,7 @@ function observationLine(observation: ObservationDetails): string {
 }
 
 function reflectionLine(reflection: ReflectionDetails): string {
-	return alignedRow("✓ reflection", "", reflection.content);
+	return alignedRow("✓ reflection", reflection.status === "dropped" ? "dropped" : "", reflection.content);
 }
 
 function noteLine(kind: string, text: string): string {
@@ -397,6 +404,7 @@ function noteRows(details: RecallObservationToolDetails, sources: RecallSourceEn
 	}
 	if (details.collision) notes.push(noteLine("id collision", `multiple memory items share ${details.memoryId}`));
 	if (details.observations.some((match) => match.observation.status === "dropped")) notes.push(noteLine("dropped", "one or more observations are dropped from active memory but remain recallable"));
+	if (details.reflections.some((reflection) => reflection.status === "dropped")) notes.push(noteLine("dropped", "one or more reflections are dropped from active memory but remain recallable"));
 	if (details.unavailableSupportingObservations.length > 0) notes.push(noteLine("missing support", details.unavailableSupportingObservations.map((item) => item.observationId).join(", ")));
 	if (details.missingSourceEntryIds.length > 0) notes.push(noteLine("missing source", details.missingSourceEntryIds.join(", ")));
 	if (details.nonSourceEntryIds.length > 0) notes.push(noteLine("non-source", details.nonSourceEntryIds.join(", ")));

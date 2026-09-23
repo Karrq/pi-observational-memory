@@ -3,6 +3,7 @@ import { recallMemorySources, type Entry, type Observation, type Reflection } fr
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 } from "../src/session-ledger/types.js";
 
@@ -72,6 +73,15 @@ function dropsEntry(id: string, observationIds: string[], coversUpToId = "src-1"
 		id,
 		customType: OM_OBSERVATIONS_DROPPED,
 		data: { observationIds, coversUpToId },
+	};
+}
+
+function reflectionDropsEntry(id: string, reflectionIds: string[], coversUpToId = "src-1"): Entry {
+	return {
+		type: "custom",
+		id,
+		customType: OM_REFLECTIONS_DROPPED,
+		data: { reflectionIds, coversUpToId },
 	};
 }
 
@@ -242,5 +252,51 @@ describe("session-ledger recall", () => {
 		expect(result.collision).toBe(true);
 		expect(result.observations).toHaveLength(1);
 		expect(result.reflections).toHaveLength(1);
+	});
+	it("marks an active reflection as active", () => {
+		const entries = [
+			sourceEntry("src-1"),
+			observationsEntry("obs-entry-1", [observation({ id: OBS_1, sourceEntryIds: ["src-1"] })]),
+			reflectionsEntry("ref-entry-1", [reflection({ id: REF_1, supportingObservationIds: [OBS_1] })]),
+		];
+
+		const result = recallMemorySources(entries, REF_1);
+
+		expect(result.status).toBe("found");
+		if (result.status !== "found") return;
+		expect(result.reflections[0].status).toBe("active");
+	});
+
+	it("recalls a dropped reflection and keeps its supporting evidence", () => {
+		const entries = [
+			sourceEntry("src-1"),
+			observationsEntry("obs-entry-1", [observation({ id: OBS_1, sourceEntryIds: ["src-1"] })]),
+			reflectionsEntry("ref-entry-1", [reflection({ id: REF_1, supportingObservationIds: [OBS_1] })]),
+			reflectionDropsEntry("ref-drop-1", [REF_1]),
+		];
+
+		const result = recallMemorySources(entries, REF_1);
+
+		expect(result.status).toBe("found");
+		if (result.status !== "found") return;
+		expect(result.kind).toBe("reflection");
+		expect(result.reflections[0].status).toBe("dropped");
+		expect(result.reflections[0].reflection.id).toBe(REF_1);
+		expect(result.observations[0].observation.id).toBe(OBS_1);
+		expect(result.sourceEntries.map((entry) => entry.id)).toEqual(["src-1"]);
+	});
+
+	it("does not let reflection tombstones mark observations as dropped", () => {
+		const entries = [
+			sourceEntry("src-1"),
+			observationsEntry("obs-entry-1", [observation({ id: OBS_1, sourceEntryIds: ["src-1"] })]),
+			reflectionDropsEntry("ref-drop-1", [OBS_1]),
+		];
+
+		const result = recallMemorySources(entries, OBS_1);
+
+		expect(result.status).toBe("found");
+		if (result.status !== "found") return;
+		expect(result.observations[0].status).toBe("active");
 	});
 });

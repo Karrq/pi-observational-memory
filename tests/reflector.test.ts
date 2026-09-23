@@ -271,4 +271,54 @@ describe("V3 reflector agent", () => {
 		const loop = fakeAgentLoop(() => {});
 		await expect(runReflector({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
 	});
+	it("treats a tombstoned reflection id as a duplicate instead of re-recording it", async () => {
+		const content = "User ships on Fridays";
+		const droppedId = hashId(content);
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			const result = await context.tools[0].execute("tool-1", {
+				reflections: [{ content, supportingObservationIds: ["aaaaaaaaaaaa"] }],
+			});
+			expect(result.details).toEqual({ added: 0, duplicates: 1, rejected: 0, total: 0 });
+		});
+
+		await expect(runReflector({
+			...baseArgs,
+			droppedReflectionIds: new Set([droppedId]),
+			agentLoop: loop,
+		})).resolves.toBeUndefined();
+	});
+
+	it("still records content whose id is not tombstoned", async () => {
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			await context.tools[0].execute("tool-1", {
+				reflections: [{ content: "User ships on Fridays", supportingObservationIds: ["aaaaaaaaaaaa"] }],
+			});
+		});
+
+		const result = await runReflector({
+			...baseArgs,
+			droppedReflectionIds: new Set([hashId("something else entirely")]),
+			agentLoop: loop,
+		});
+
+		expect(result?.map((ref) => ref.content)).toEqual(["User ships on Fridays"]);
+	});
+
+	it("does not show tombstoned reflections to the model", async () => {
+		const dropped = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"], { content: "obsolete fact" });
+		let userText = "";
+		const loop = fakeAgentLoop((prompts) => {
+			userText = prompts[0].content[0].text;
+		});
+
+		await runReflector({
+			...baseArgs,
+			reflections: [],
+			droppedReflectionIds: new Set([dropped.id]),
+			agentLoop: loop,
+		});
+
+		expect(userText).not.toContain("obsolete fact");
+		expect(userText).toContain("CURRENT REFLECTIONS:\n(none yet)");
+	});
 });

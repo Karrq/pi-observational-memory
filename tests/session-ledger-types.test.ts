@@ -4,9 +4,11 @@ import {
 	OM_FOLDED,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
+	buildReflectionsDroppedData,
 	buildReflectionsRecordedData,
 	isMemoryDetails,
 	isObservationsDroppedData,
@@ -15,6 +17,8 @@ import {
 	isObservationsRecordedEntry,
 	isObservation,
 	isReflection,
+	isReflectionsDroppedData,
+	isReflectionsDroppedEntry,
 	isReflectionsRecordedData,
 	isReflectionsRecordedEntry,
 } from "../src/session-ledger/index.js";
@@ -23,6 +27,7 @@ import {
 	observation,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
+	reflectionsDroppedEntry,
 	oldV2CompactionDetails,
 	oldV2ObservationEntry,
 	reflection,
@@ -111,5 +116,36 @@ describe("session-ledger V3 type guards and builders", () => {
 	it("ignores old V2 observation entries and old V2 compaction details", () => {
 		expect(isObservationsRecordedEntry(oldV2ObservationEntry("v2-entry"))).toBe(false);
 		expect(isMemoryDetails(oldV2CompactionDetails())).toBe(false);
+	});
+	it("validates reflection-drop data and entries", () => {
+		expect(isReflectionsDroppedData({ reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" })).toBe(true);
+		expect(isReflectionsDroppedData({ reflectionIds: [], coversUpToId: "om-ref" })).toBe(false);
+		expect(isReflectionsDroppedData({ reflectionIds: ["eeeeeeeeeeee"] })).toBe(false);
+		expect(isReflectionsDroppedData({ observationIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" })).toBe(false);
+		expect(isReflectionsDroppedEntry(reflectionsDroppedEntry("om-ref-drop", {
+			reflectionIds: ["eeeeeeeeeeee"],
+			coversUpToId: "om-ref",
+		}))).toBe(true);
+		expect(isReflectionsDroppedEntry(observationsDroppedEntry("om-drop", {
+			observationIds: ["aaaaaaaaaaaa"],
+			coversUpToId: "om-ref",
+		}))).toBe(false);
+		expect(isObservationsDroppedEntry(reflectionsDroppedEntry("om-ref-drop", {
+			reflectionIds: ["eeeeeeeeeeee"],
+			coversUpToId: "om-ref",
+		}))).toBe(false);
+	});
+
+	it("builds reflection-drop data only for a non-empty id list with a marker", () => {
+		expect(buildReflectionsDroppedData(["eeeeeeeeeeee"], "om-ref")).toEqual({
+			reflectionIds: ["eeeeeeeeeeee"],
+			coversUpToId: "om-ref",
+		});
+		expect(buildReflectionsDroppedData([], "om-ref")).toBeUndefined();
+		expect(buildReflectionsDroppedData(["eeeeeeeeeeee"], "")).toBeUndefined();
+	});
+
+	it("names the reflection-drop custom type", () => {
+		expect(OM_REFLECTIONS_DROPPED).toBe("om.reflections.dropped");
 	});
 });

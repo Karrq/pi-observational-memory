@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
+import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
+import { reflectionPoolMetrics } from "../agents/reflection-dropper/pool.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens } from "../config.js";
@@ -10,9 +12,11 @@ import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
+	buildReflectionsDroppedData,
 	buildReflectionsRecordedData,
 	earlierCoverageMarkerId,
 	foldLedger,
@@ -33,7 +37,18 @@ import {
 
 type ResolvedModel = Extract<ResolveResult, { ok: true }>;
 
-type ConsolidationCtx = {
+export type ConsolidationOptions = {
+	/**
+	 * Ignore stage cadence clocks and run every stage that has work.
+	 *
+	 * Used by `/om:consolidate`. Force overrides scheduling only: pool targets,
+	 * coverage requirements, and drop caps still apply, because those are safety
+	 * bounds rather than timers.
+	 */
+	force?: boolean;
+};
+
+export type ConsolidationCtx = {
 	cwd: string;
 	hasUI: boolean;
 	ui?: { notify: (message: string, type?: "warning" | "info" | "error") => void };
@@ -51,8 +66,24 @@ type StageOutcome = "continue" | "abort";
 
 type ReflectorStageResult = {
 	outcome: StageOutcome;
+	/**
+	 * Whether the reflector clock was due this run, regardless of whether the
+	 * reflector produced output. The reflection dropper runs on this signal:
+	 * "the session moved on" is exactly the case where the reflector has nothing
+	 * new to say while stale reflections keep occupying the pool.
+	 */
+	due: boolean;
 	sameRunReflections: Reflection[];
 	effectiveReflectionCoverageId?: string;
+};
+
+/**
+ * The reflection dropper has no abort outcome: a skipped, failed, or
+ * model-less run must not stop the observation dropper, which resolves its own
+ * model and reads post-drop ledger state either way.
+ */
+type ReflectionDropperStageResult = {
+	sameRunDroppedReflectionIds: string[];
 };
 
 function sourceEntriesAfter(entries: Entry[], index: number): Entry[] {
@@ -319,12 +350,14 @@ export async function runConsolidationPipeline(
 	pi: ExtensionAPI,
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
+	options: ConsolidationOptions = {},
 ): Promise<void> {
 	const resolver = makeModelResolver(runtime, ctx);
+	const force = options.force === true;
 
 	runtime.consolidationPhase = "observer";
 	try {
-		const observerOutcome = await runObserverStage(pi, runtime, ctx, resolver);
+		const observerOutcome = await runObserverStage(pi, runtime, ctx, resolver, force);
 		if (observerOutcome === "abort") return;
 	} catch (error) {
 		debugLog("observer.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "observer", error) });
@@ -334,16 +367,36 @@ export async function runConsolidationPipeline(
 	runtime.consolidationPhase = "reflector";
 	let reflectorResult: ReflectorStageResult;
 	try {
-		reflectorResult = await runReflectorStage(pi, runtime, ctx, resolver);
+		reflectorResult = await runReflectorStage(pi, runtime, ctx, resolver, force);
 		if (reflectorResult.outcome === "abort") return;
 	} catch (error) {
 		debugLog("reflector.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflector", error) });
 		return;
 	}
 
+	// Reflection drops must land before the observation dropper reads reflection
+	// coverage: an observation dropped against a reflection that died this same
+	// run would lose its durable meaning in both layers at once.
+	runtime.consolidationPhase = "reflection-dropper";
+	let reflectionDropResult: ReflectionDropperStageResult = { sameRunDroppedReflectionIds: [] };
+	try {
+		reflectionDropResult = await runReflectionDropperStage(pi, runtime, ctx, resolver, reflectorResult.due);
+	} catch (error) {
+		debugLog("reflection_dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflection-dropper", error) });
+	}
+
 	runtime.consolidationPhase = "dropper";
 	try {
-		await runDropperStage(pi, runtime, ctx, resolver, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
+		await runDropperStage(
+			pi,
+			runtime,
+			ctx,
+			resolver,
+			reflectorResult.sameRunReflections,
+			reflectorResult.effectiveReflectionCoverageId,
+			reflectionDropResult.sameRunDroppedReflectionIds,
+			force,
+		);
 	} catch (error) {
 		debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
 	}
@@ -354,12 +407,13 @@ async function runObserverStage(
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
 	resolver: ModelResolver,
+	force: boolean,
 ): Promise<StageOutcome> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
 	const real = currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : undefined;
 	const tokens = real !== undefined ? real : rawTokensSinceObservationCoverage(entries); // fallback: no usage baseline / basis change
-	if (tokens < runtime.config.observeAfterTokens) return "continue";
+	if (!force && tokens < runtime.config.observeAfterTokens) return "continue";
 
 	const sessionMetadata = debugSessionMetadata(ctx);
 	const sessionIdentity = sessionMetadata.sessionId ?? sessionMetadata.sessionFile;
@@ -369,7 +423,10 @@ async function runObserverStage(
 	// must not re-fire the observer every turn over the same span. Retry only
 	// after another observeAfterTokens worth of new source tokens arrives, and
 	// drop the backoff as soon as coverage advances.
-	const backoff = runtime.observerEmptyBackoff;
+	// A forced run is explicit user intent, so it clears the backoff instead of
+	// honoring it.
+	const backoff = force ? undefined : runtime.observerEmptyBackoff;
+	if (force) runtime.observerEmptyBackoff = undefined;
 	if (backoff) {
 		if (
 			sessionIdentity !== backoff.sessionIdentity
@@ -495,22 +552,23 @@ async function runReflectorStage(
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
 	resolver: ModelResolver,
+	force: boolean,
 ): Promise<ReflectorStageResult> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
 	const real = currentTokens !== undefined ? realTokensSinceAnchor(entries, OM_REFLECTIONS_RECORDED, currentTokens) : undefined;
 	const reflectionTokens = real !== undefined ? real : rawTokensSinceReflectionCoverage(entries); // fallback: no usage baseline / basis change
-	if (reflectionTokens < runtime.config.reflectAfterTokens) return { outcome: "continue", sameRunReflections: [] };
+	if (!force && reflectionTokens < runtime.config.reflectAfterTokens) return { outcome: "continue", due: false, sameRunReflections: [] };
 
 	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
-	if (!observationCoverageId) return { outcome: "continue", sameRunReflections: [] };
+	if (!observationCoverageId) return { outcome: "continue", due: true, sameRunReflections: [] };
 
 	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: reflector running (~${reflectionTokens.toLocaleString()} tokens)`,
 		"info",
 	);
 	const resolved = await resolver.resolve("reflector");
-	if (!resolved) return { outcome: "abort", sameRunReflections: [] };
+	if (!resolved) return { outcome: "abort", due: true, sameRunReflections: [] };
 
 	const folded = foldLedger(entries);
 	const reflections = await runStageWithFallback(ctx, "reflector", resolved, resolver, (worker) => runReflector({
@@ -518,23 +576,112 @@ async function runReflectorStage(
 		apiKey: worker.apiKey,
 		headers: worker.headers,
 		env: worker.env,
-		reflections: folded.reflections,
+		reflections: folded.activeReflections,
+		droppedReflectionIds: folded.droppedReflectionIds,
 		observations: folded.activeObservations,
 		maxTurns: runtime.config.agentMaxTurns,
 		maxOutputTokens: runtime.config.agentMaxTokens,
 		thinkingLevel: workerThinkingLevel(runtime, worker),
 		modelRegistry: ctx.modelRegistry,
 	}));
-	if (!reflections) return { outcome: "continue", sameRunReflections: [] };
+	if (!reflections) return { outcome: "continue", due: true, sameRunReflections: [] };
 
 	const data = buildReflectionsRecordedData(reflections, observationCoverageId);
-	if (!data) return { outcome: "continue", sameRunReflections: [] };
+	if (!data) return { outcome: "continue", due: true, sameRunReflections: [] };
 	appendEntry(pi, OM_REFLECTIONS_RECORDED, data);
 	return {
 		outcome: "continue",
+		due: true,
 		sameRunReflections: reflections,
 		effectiveReflectionCoverageId: data.coversUpToId,
 	};
+}
+
+/**
+ * Prune the active reflection pool back toward `reflectionsPoolTargetTokens`.
+ *
+ * Gated on the reflector clock being due rather than on the reflector having
+ * produced output: reflections go stale exactly when the session moves to new
+ * work, which is when the reflector has nothing new to record.
+ */
+async function runReflectionDropperStage(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	resolver: ModelResolver,
+	reflectorDue: boolean,
+): Promise<ReflectionDropperStageResult> {
+	if (!reflectorDue) {
+		debugLog("reflection_dropper.reflector_not_due", {});
+		return { sameRunDroppedReflectionIds: [] };
+	}
+
+	const entries = ctx.sessionManager.getBranch() as Entry[];
+	const folded = foldLedger(entries);
+	const metrics = reflectionPoolMetrics(folded.activeReflections, runtime.config.reflectionsPoolTargetTokens);
+	if (!metrics.ready) {
+		debugLog("reflection_dropper.not_ready", {
+			reflectionTokens: metrics.reflectionTokens,
+			targetTokens: metrics.targetTokens,
+			tokensOverTarget: metrics.tokensOverTarget,
+			fullness: metrics.fullness,
+			activeReflectionCount: metrics.activeReflectionCount,
+			maxDropsAllowed: metrics.maxDropsAllowed,
+		});
+		return { sameRunDroppedReflectionIds: [] };
+	}
+
+	// Reflection drops are a function of reflection-pool state, so they carry the
+	// same watermark as the reflections they prune: a drop enters a bounded
+	// projection exactly when its reflections do.
+	const coversUpToId = latestCoverageMarkerId(entries, OM_REFLECTIONS_RECORDED);
+	if (!coversUpToId) return { sameRunDroppedReflectionIds: [] };
+
+	debugLog("reflection_dropper.stage_start", {
+		coversUpToId,
+		activeReflectionCount: metrics.activeReflectionCount,
+		reflectionTokens: metrics.reflectionTokens,
+		targetTokens: metrics.targetTokens,
+		tokensOverTarget: metrics.tokensOverTarget,
+		fullness: metrics.fullness,
+		maxDropsAllowed: metrics.maxDropsAllowed,
+	});
+
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+		`Observational memory: reflection dropper running — reflection pool ~${metrics.reflectionTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
+		"info",
+	);
+	const resolved = await resolver.resolve("reflection-dropper");
+	if (!resolved) return { sameRunDroppedReflectionIds: [] };
+
+	const droppedIds = await runStageWithFallback(ctx, "reflection-dropper", resolved, resolver, (worker) => runReflectionDropper({
+		model: worker.model as any,
+		apiKey: worker.apiKey,
+		headers: worker.headers,
+		env: worker.env,
+		reflections: folded.activeReflections,
+		observations: folded.activeObservations,
+		observationsById: folded.observationsById,
+		droppedObservationIds: folded.droppedObservationIds,
+		targetTokens: runtime.config.reflectionsPoolTargetTokens,
+		maxTurns: runtime.config.agentMaxTurns,
+		maxOutputTokens: runtime.config.agentMaxTokens,
+		thinkingLevel: workerThinkingLevel(runtime, worker),
+		modelRegistry: ctx.modelRegistry,
+	}));
+	const data = droppedIds ? buildReflectionsDroppedData(droppedIds, coversUpToId) : undefined;
+	debugLog("reflection_dropper.append", {
+		droppedIdsCount: droppedIds?.length ?? 0,
+		coversUpToId,
+		dataBuilt: data !== undefined,
+		appended: data !== undefined,
+	});
+	if (data) appendEntry(pi, OM_REFLECTIONS_DROPPED, data);
+	if (data && shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+		`Observational memory: ${data.reflectionIds.length} reflection${data.reflectionIds.length === 1 ? "" : "s"} dropped`,
+		"info",
+	);
+	return { sameRunDroppedReflectionIds: data ? data.reflectionIds : [] };
 }
 
 async function runDropperStage(
@@ -544,8 +691,13 @@ async function runDropperStage(
 	resolver: ModelResolver,
 	sameRunReflections: Reflection[],
 	sameRunReflectionCoverageId: string | undefined,
+	sameRunDroppedReflectionIds: string[],
+	force: boolean,
 ): Promise<StageOutcome> {
-	if (!sameRunReflectionCoverageId || sameRunReflections.length === 0) {
+	// Automatic runs prune observations only right after fresh distillation, so
+	// drops are always judged against just-updated coverage. A forced run has no
+	// later opportunity to come back, so it prunes against existing reflections.
+	if (!force && (!sameRunReflectionCoverageId || sameRunReflections.length === 0)) {
 		debugLog("dropper.waiting_for_reflection", { sameRunReflections: sameRunReflections.length });
 		return "continue";
 	}
@@ -553,6 +705,10 @@ async function runDropperStage(
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
 	if (!observationCoverageId) return "continue";
+	// Without same-run reflections, fall back to the ledger's latest reflection
+	// coverage so drop effects still never enter a projection ahead of the
+	// reflections that justify them.
+	const reflectionCoverageId = sameRunReflectionCoverageId ?? latestCoverageMarkerId(entries, OM_REFLECTIONS_RECORDED);
 
 	const folded = foldLedger(entries);
 	const metrics = observationPoolMetrics(folded.activeObservations, runtime.config.observationsPoolTargetTokens);
@@ -570,6 +726,7 @@ async function runDropperStage(
 	}
 	debugLog("dropper.stage_start", {
 		observationCoverageId,
+		reflectionCoverageId,
 		sameRunReflectionCoverageId,
 		sameRunReflectionCount: sameRunReflections.length,
 		activeObservationCount: metrics.activeObservationCount,
@@ -587,7 +744,14 @@ async function runDropperStage(
 	const resolved = await resolver.resolve("dropper");
 	if (!resolved) return "abort";
 
-	const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
+	// Coverage evidence must come from reflections that are still active. An
+	// observation dropped against a reflection tombstoned earlier in this same
+	// run would lose its durable meaning in both layers at once.
+	const droppedReflectionIds = new Set([...folded.droppedReflectionIds, ...sameRunDroppedReflectionIds]);
+	const reflectionsForDropper = mergeReflections(
+		folded.activeReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
+		sameRunReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
+	);
 	const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
 		model: worker.model as any,
 		apiKey: worker.apiKey,
@@ -601,7 +765,7 @@ async function runDropperStage(
 		thinkingLevel: workerThinkingLevel(runtime, worker),
 		modelRegistry: ctx.modelRegistry,
 	}));
-	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
+	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, reflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("dropper.append", {
 		droppedIdsCount: droppedIds?.length ?? 0,

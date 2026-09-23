@@ -66,6 +66,12 @@ A drop is a tombstone for observation ids that should no longer be active memory
 
 Dropping does not delete history. Dropped observations remain recallable from ledger history, but they are not active observations in projections.
 
+### Reflection drops
+
+A reflection drop is a tombstone for reflection ids that no longer deserve permanent space. Reflection drops are written by the reflection dropper into `om.reflections.dropped` ledger entries and follow the same rules: dropped reflections leave active memory and every projection, but stay recallable from ledger history.
+
+Reflection ids are content hashes, so a tombstone is permanent for that exact content. The reflector therefore counts tombstoned ids as duplicates: re-deriving dropped content would append a record the fold immediately re-suppresses.
+
 ## Actors
 
 ### Observer
@@ -78,7 +84,15 @@ It receives an oldest-first chunk of raw/source entries, validates source ids, a
 
 The reflector runs in the reflect/drop lane from `turn_end` when its raw-token clock reaches `reflectAfterTokens` and the observer is not due.
 
-It reads active observations and current reflections, then appends durable new reflections as `om.reflections.recorded`. Reflections must cite valid supporting observation ids. The reflector's coverage annotations describe current support state only; this first coverage-stewardship model does not repair historical coverage on existing reflections that already missed a supporting observation id.
+It reads active observations and active reflections, then appends durable new reflections as `om.reflections.recorded`. Reflections must cite valid supporting observation ids. The reflector's coverage annotations describe current support state only; this first coverage-stewardship model does not repair historical coverage on existing reflections that already missed a supporting observation id.
+
+### Reflection dropper
+
+The reflection dropper keeps the durable layer bounded. It runs when the reflector clock is due and the folded active reflection pool is over `reflectionsPoolTargetTokens`. Unlike the observation dropper, it does not require same-run reflector output: reflections go stale exactly when the session moves to new work, which is when the reflector has nothing new to record.
+
+It can only drop active reflection ids; it cannot edit, merge, or replace them. Reflections carry no timestamp, so each candidate is annotated with deterministic evidence derived from its supporting observations: last evidence time (the newest supporting observation, including dropped ones), active and dropped support counts, and orphan risk. Orphan risk counts supporting observations that were already dropped from active memory and are cited by no other active reflection; dropping such a reflection would remove that meaning from active memory entirely. Code ranks orphan-free candidates first, then older evidence, and caps the run at a pool-derived maximum.
+
+Reflection drops are applied before the observation dropper reads reflection coverage, so an observation is never dropped against a reflection that died in the same run.
 
 ### Dropper
 
@@ -90,7 +104,7 @@ The dropper can only drop active observation ids. It cannot rewrite or merge obs
 
 The compaction hook runs during `session_before_compact`. When V3 memory exists, it is deterministic and model-free:
 
-- it does not run observer, reflector, or dropper;
+- it does not run observer, reflector, or either dropper;
 - it does not call a model;
 - it does not wait for background memory workers;
 - it folds/projects ledger state and renders the summary.
@@ -99,7 +113,7 @@ If the projection is empty, the hook returns no extension compaction and Pi uses
 
 ## Ledger entries
 
-V3 uses three custom memory ledger entry types:
+V3 uses four custom memory ledger entry types:
 
 ```ts
 om.observations.recorded: {
@@ -114,6 +128,11 @@ om.reflections.recorded: {
 
 om.observations.dropped: {
   observationIds: string[];
+  coversUpToId: string;
+}
+
+om.reflections.dropped: {
+  reflectionIds: string[];
   coversUpToId: string;
 }
 ```
@@ -163,7 +182,7 @@ Visible and full memory can differ intentionally. Background ledger work may hap
 Recall can return:
 
 - an observation, marked `active` or `dropped`;
-- a reflection plus supporting observations;
+- a reflection, marked `active` or `dropped`, plus supporting observations;
 - a mixed result if an id collision exists;
 - missing/non-source diagnostics when source evidence is unavailable.
 
@@ -197,12 +216,14 @@ When upgrading from V2, update settings and start a new clean session.
 | Observation | Timestamped source-backed event record. |
 | Reflection | Durable conclusion backed by observations. |
 | Drop | Tombstone that removes an observation id from active memory. |
+| Reflection drop | Tombstone that removes a reflection id from active memory. |
 | Visible memory | Latest folded memory visible to the agent through compaction details. |
 | Full memory | Full V3 ledger truth folded at branch tip or another boundary. |
-| Full fold | Compaction mode that folds observations, reflections, and drops through the boundary. |
+| Full fold | Compaction mode that folds observations, reflections, and both kinds of drops through the boundary. |
 | Progress watermark | `coversUpToId`; marker used for raw-token progress clocks. |
 | Observer | Background agent that records observations. |
 | Reflector | Background agent that records durable reflections. |
+| Reflection dropper | Background agent that drops active reflections by id. |
 | Dropper | Background agent that drops active observations by id. |
 | Recall | Agent tool for exact evidence behind a memory id. |
 

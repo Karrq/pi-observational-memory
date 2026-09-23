@@ -15,6 +15,7 @@ import {
 	observationsRecordedEntry,
 	oldV2CompactionDetails,
 	reflection,
+	reflectionsDroppedEntry,
 	reflectionsRecordedEntry,
 	textCustomMessage,
 } from "./fixtures/session.js";
@@ -203,5 +204,84 @@ describe("session-ledger V3 projections", () => {
 
 		expect(diff.observationsOnlyInFull.map((obs) => obs.id)).toEqual(["bbbbbbbbbbbb"]);
 		expect(diff.reflectionsOnlyInFull.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+	});
+	it("full projection applies reflection drops through the target", () => {
+		const obs1 = observation("aaaaaaaaaaaa");
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const ref2 = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obs1], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref1, ref2], coversUpToId: "raw-1" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" }),
+		];
+
+		expect(fullProjection(entries).reflections.map((ref) => ref.id)).toEqual(["ffffffffffff"]);
+		// Bounded before the drop's own coverage marker, both reflections still project.
+		expect(fullProjection(entries, "om-obs").reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
+	});
+
+	it("normal compaction projection holds reflection drops at the last full-fold boundary", () => {
+		const obs1 = observation("aaaaaaaaaaaa", { tokenCount: 5 });
+		const obs2 = observation("bbbbbbbbbbbb", { tokenCount: 5 });
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const ref2 = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-eeeeeeeeeeee", { reflections: [ref1], coversUpToId: "raw-1" }),
+			compactionEntry("cmp-full", { firstKeptEntryId: "raw-1", details: memoryDetails({ fullFold: true, observations: [obs1], reflections: [ref1] }) }),
+			textCustomMessage("raw-2", "bbbb"),
+			observationsRecordedEntry("om-bbbbbbbbbbbb", { observations: [obs2], coversUpToId: "raw-2" }),
+			reflectionsRecordedEntry("om-ffffffffffff", { reflections: [ref2], coversUpToId: "raw-2" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-2" }),
+		];
+
+		const result = buildCompactionProjection(entries, "raw-2", { observationsPoolMaxTokens: 100 });
+
+		// The drop covers past the maintenance boundary, so it is held back with the reflections it prunes.
+		expect(result.fullFold).toBe(false);
+		expect(result.reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+	});
+
+	it("full compaction projection applies reflection drops by coverage marker", () => {
+		const obs1 = observation("aaaaaaaaaaaa", { tokenCount: 80 });
+		const obs2 = observation("bbbbbbbbbbbb", { tokenCount: 30 });
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const ref2 = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-eeeeeeeeeeee", { reflections: [ref1], coversUpToId: "raw-1" }),
+			compactionEntry("cmp-full", { firstKeptEntryId: "raw-1", details: memoryDetails({ fullFold: true, observations: [obs1], reflections: [ref1] }) }),
+			textCustomMessage("raw-2", "bbbb"),
+			observationsRecordedEntry("om-bbbbbbbbbbbb", { observations: [obs2], coversUpToId: "raw-2" }),
+			reflectionsRecordedEntry("om-ffffffffffff", { reflections: [ref2], coversUpToId: "raw-2" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-2" }),
+		];
+
+		const result = buildCompactionProjection(entries, "raw-2", { observationsPoolMaxTokens: 100 });
+
+		expect(result.fullFold).toBe(true);
+		expect(result.reflections.map((ref) => ref.id)).toEqual(["ffffffffffff"]);
+		expect(result.details.reflections.map((ref) => ref.id)).toEqual(["ffffffffffff"]);
+	});
+
+	it("diff reports reflections dropped since the visible projection", () => {
+		const obs1 = observation("aaaaaaaaaaaa");
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const ref2 = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obs1], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref1, ref2], coversUpToId: "raw-1" }),
+			compactionEntry("cmp", { firstKeptEntryId: "raw-1", details: memoryDetails({ observations: [obs1], reflections: [ref1, ref2] }) }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" }),
+		];
+
+		const diff = diffProjection(visibleProjection(entries), fullProjection(entries));
+
+		expect(diff.droppedReflectionsOnlyInFull.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+		expect(diff.reflectionsOnlyInFull).toEqual([]);
 	});
 });

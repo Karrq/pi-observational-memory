@@ -1,9 +1,11 @@
 import {
 	isObservationsDroppedData,
 	isObservationsRecordedData,
+	isReflectionsDroppedData,
 	isReflectionsRecordedData,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 	type Entry,
 	type Observation,
@@ -22,8 +24,12 @@ export type FoldedLedger = {
 	activeObservations: Observation[];
 	/** Tombstoned observation ids, including ids that may not have a corresponding folded observation. */
 	droppedObservationIds: Set<string>;
-	/** All first-valid reflection records encountered through the fold boundary. */
+	/** All first-valid reflection records encountered through the fold boundary, including dropped reflections. */
 	reflections: Reflection[];
+	/** Reflection records not tombstoned by a folded reflection-drop entry. */
+	activeReflections: Reflection[];
+	/** Tombstoned reflection ids, including ids that may not have a corresponding folded reflection. */
+	droppedReflectionIds: Set<string>;
 	/** All first-valid observation records by id, including dropped observations. */
 	observationsById: Map<string, Observation>;
 	/** All first-valid reflection records by id. */
@@ -51,6 +57,7 @@ export function foldLedger(entries: Entry[], options: FoldLedgerOptions = {}): F
 	const observationsById = new Map<string, Observation>();
 	const reflectionsById = new Map<string, Reflection>();
 	const droppedObservationIds = new Set<string>();
+	const droppedReflectionIds = new Set<string>();
 	const endIdx = foldEndIndex(entries, options.upToEntryId);
 
 	for (let i = 0; i <= endIdx; i++) {
@@ -82,18 +89,29 @@ export function foldLedger(entries: Entry[], options: FoldLedgerOptions = {}): F
 			for (const observationId of entry.data.observationIds) {
 				droppedObservationIds.add(observationId);
 			}
+			continue;
+		}
+
+		if (isCustomEntry(entry, OM_REFLECTIONS_DROPPED)) {
+			if (!isReflectionsDroppedData(entry.data)) continue;
+			for (const reflectionId of entry.data.reflectionIds) {
+				droppedReflectionIds.add(reflectionId);
+			}
 		}
 	}
 
 	const observations = Array.from(observationsById.values());
 	const activeObservations = observations.filter((observation) => !droppedObservationIds.has(observation.id));
 	const reflections = Array.from(reflectionsById.values());
+	const activeReflections = reflections.filter((reflection) => !droppedReflectionIds.has(reflection.id));
 
 	return {
 		observations,
 		activeObservations,
 		droppedObservationIds,
 		reflections,
+		activeReflections,
+		droppedReflectionIds,
 		observationsById,
 		reflectionsById,
 	};

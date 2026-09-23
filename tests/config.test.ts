@@ -43,6 +43,7 @@ describe("V3 config", () => {
 			compactAfterTokensRatio: 0.68,
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
+			reflectionsPoolTargetTokens: 8000,
 			agentMaxTurns: 16,
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
@@ -301,5 +302,22 @@ describe("V3 config", () => {
 			expect(resolveCompactAfterTokens(config, 0)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, -1)).toBe(81000);
 		});
+	});
+
+	it("reads reflectionsPoolTargetTokens from settings and rejects invalid values", () => {
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: 3000 },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(3000);
+
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: 0 },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(8000);
+
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: "many" },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(8000);
 	});
 });
