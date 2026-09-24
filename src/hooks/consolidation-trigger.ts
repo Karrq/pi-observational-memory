@@ -3,11 +3,11 @@ import { runDropper } from "../agents/dropper/agent.js";
 import { runSystemOneDropper, scoreObservations } from "../agents/dropper/system-one/agent.js";
 import { dropProbability, type ObservationSignals } from "../agents/dropper/system-one/questions.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
-import { appendDropScores, type DropScoreRow } from "../drop-scores.js";
+import { appendDropScores, appendReflectionDropScores, type DropScoreRow, type ReflectionDropRow } from "../drop-scores.js";
 import { coverageTierForObservation, reflectionCoverageMap } from "../agents/dropper/coverage.js";
 import { selectDropCandidates } from "../agents/dropper/agent.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
-import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
+import { reflectionEvidenceMap, runReflectionDropper, selectReflectionDropCandidates } from "../agents/reflection-dropper/agent.js";
 import { reflectionPoolMetrics } from "../agents/reflection-dropper/pool.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
@@ -391,6 +391,57 @@ function recordDropScores(args: {
 	});
 }
 
+/**
+ * Write one row per active reflection, pairing what the reflection dropper
+ * proposed with what the budget let through. Rows cover the whole pool, kept
+ * reflections included, so a run with no drops is still recorded.
+ */
+function recordReflectionDropScores(args: {
+	ctx: ConsolidationCtx;
+	folded: ReturnType<typeof foldLedger>;
+	droppedIds: string[] | undefined;
+	proposedIds: readonly string[] | undefined;
+}): void {
+	const { ctx, folded, droppedIds, proposedIds } = args;
+	const reflections = folded.activeReflections;
+	if (reflections.length === 0) return;
+
+	const evidenceById = reflectionEvidenceMap(reflections, {
+		observationsById: folded.observationsById,
+		droppedObservationIds: folded.droppedObservationIds,
+	});
+	const sortOrder = selectReflectionDropCandidates(
+		reflections.map((reflection) => reflection.id),
+		reflections,
+		reflections.length,
+		evidenceById,
+	);
+	const sortRank = new Map(sortOrder.map((id, index) => [id, index]));
+	const dropped = new Set(droppedIds ?? []);
+	const proposed = new Set(proposedIds ?? []);
+	const ts = new Date().toISOString();
+	const { sessionId } = debugSessionMetadata(ctx);
+
+	const rows: ReflectionDropRow[] = reflections.map((reflection) => {
+		const evidence = evidenceById.get(reflection.id);
+		return {
+			ts,
+			sessionId,
+			reflectionId: reflection.id,
+			proposed: proposed.has(reflection.id),
+			decision: dropped.has(reflection.id) ? "drop" as const : "keep" as const,
+			sortRank: sortRank.get(reflection.id) ?? reflections.length,
+			orphanCount: evidence?.orphanCount ?? 0,
+			activeSupportCount: evidence?.activeSupportCount ?? 0,
+			droppedSupportCount: evidence?.droppedSupportCount ?? 0,
+			...(evidence?.lastEvidenceTimestamp ? { lastEvidenceTimestamp: evidence.lastEvidenceTimestamp } : {}),
+		};
+	});
+
+	const written = appendReflectionDropScores(sessionId, rows);
+	debugLog("reflection_dropper.scores_recorded", { written, rowCount: rows.length });
+}
+
 function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
 	runtime.ensureConfig(ctx.cwd);
 	if (runtime.config.passive === true) return;
@@ -729,6 +780,7 @@ async function runReflectionDropperStage(
 	const resolved = await resolver.resolve("reflection-dropper");
 	if (!resolved) return { sameRunDroppedReflectionIds: [] };
 
+	let proposedIds: readonly string[] | undefined;
 	const droppedIds = await runStageWithFallback(ctx, "reflection-dropper", resolved, resolver, (worker) => runReflectionDropper({
 		model: worker.model as any,
 		apiKey: worker.apiKey,
@@ -743,7 +795,13 @@ async function runReflectionDropperStage(
 		maxOutputTokens: runtime.config.agentMaxTokens,
 		thinkingLevel: workerThinkingLevel(runtime, worker),
 		modelRegistry: ctx.modelRegistry,
+		onProposedIds: (ids) => { proposedIds = ids; },
 	}));
+	// Recorded under the same switch as the observation score log, so drop
+	// evaluation data is either collected for both droppers or for neither.
+	if ((runtime.config.systemOneDropper?.mode ?? "off") !== "off") {
+		recordReflectionDropScores({ ctx, folded, droppedIds, proposedIds });
+	}
 	const data = droppedIds ? buildReflectionsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("reflection_dropper.append", {
 		droppedIdsCount: droppedIds?.length ?? 0,

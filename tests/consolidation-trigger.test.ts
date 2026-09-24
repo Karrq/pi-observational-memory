@@ -8,6 +8,7 @@ const mockAgents = vi.hoisted(() => ({
 	runSystemOneDropper: vi.fn(),
 	scoreObservations: vi.fn(),
 	appendDropScores: vi.fn(),
+	appendReflectionDropScores: vi.fn(),
 }));
 
 vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
@@ -15,7 +16,11 @@ vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 	runObserver: mockAgents.runObserver,
 }));
 vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.runReflector }));
-vi.mock("../src/agents/reflection-dropper/agent.js", () => ({ runReflectionDropper: mockAgents.runReflectionDropper }));
+// The evidence and sort helpers stay real; the score log ranks the pool with them.
+vi.mock("../src/agents/reflection-dropper/agent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/agents/reflection-dropper/agent.js")>()),
+	runReflectionDropper: mockAgents.runReflectionDropper,
+}));
 // Only the agent entry point is stubbed; selectDropCandidates is a pure ranking
 // helper the score log uses for its heuristic baseline.
 vi.mock("../src/agents/dropper/agent.js", async (importOriginal) => ({
@@ -29,6 +34,7 @@ vi.mock("../src/agents/dropper/system-one/agent.js", () => ({
 vi.mock("../src/drop-scores.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../src/drop-scores.js")>()),
 	appendDropScores: mockAgents.appendDropScores,
+	appendReflectionDropScores: mockAgents.appendReflectionDropScores,
 }));
 
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
@@ -60,6 +66,8 @@ beforeEach(() => {
 	mockAgents.appendDropScores.mockReset();
 	mockAgents.scoreObservations.mockResolvedValue({ signalsById: new Map(), requestCount: 0, inputTokens: 0 });
 	mockAgents.appendDropScores.mockReturnValue(true);
+	mockAgents.appendReflectionDropScores.mockReset();
+	mockAgents.appendReflectionDropScores.mockReturnValue(true);
 	mockAgents.runObserver.mockResolvedValue(undefined);
 	mockAgents.runReflector.mockResolvedValue(undefined);
 	mockAgents.runReflectionDropper.mockResolvedValue(undefined);
@@ -1307,6 +1315,56 @@ describe("V3 reflection dropper stage", () => {
 			targetTokens: 5,
 		}));
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_REFLECTIONS_DROPPED, { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-1" });
+	});
+
+	it("records what the reflection dropper proposed next to what the budget let through", async () => {
+		const refB = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
+		mockAgents.runReflectionDropper.mockImplementationOnce(async (args: any) => {
+			args.onProposedIds(["eeeeeeeeeeee", "ffffffffffff"]);
+			return ["eeeeeeeeeeee"];
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA, obsB], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [refA, refB], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			reflectionsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.appendReflectionDropScores).toHaveBeenCalledTimes(1);
+		const [sessionId, rows] = mockAgents.appendReflectionDropScores.mock.calls[0];
+		expect(sessionId).toBe("session-1");
+		expect(rows.map((row: any) => [row.reflectionId, row.proposed, row.decision])).toEqual([
+			["eeeeeeeeeeee", true, "drop"],
+			["ffffffffffff", true, "keep"],
+		]);
+		expect(rows.map((row: any) => row.sortRank).sort()).toEqual([0, 1]);
+		expect(JSON.stringify(rows)).not.toContain(refA.content);
+	});
+
+	it("does not record reflection drop scores when the System One dropper is off", async () => {
+		mockAgents.runReflectionDropper.mockResolvedValueOnce(["eeeeeeeeeeee"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [refA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({ entries, observeAfterTokens: 999, reflectionsPoolTargetTokens: 5 });
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runReflectionDropper).toHaveBeenCalled();
+		expect(mockAgents.appendReflectionDropScores).not.toHaveBeenCalled();
 	});
 
 	it("does not run the reflection dropper when the reflector clock is not due", async () => {

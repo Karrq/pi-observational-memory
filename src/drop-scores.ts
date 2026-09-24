@@ -7,6 +7,7 @@ import type { ReflectionCoverageTier } from "./agents/dropper/coverage.js";
 import type { Relevance } from "./session-ledger/index.js";
 
 export const DROP_SCORES_RELATIVE_DIR = join("observational-memory", "drop-scores");
+export const REFLECTION_DROP_SCORES_RELATIVE_DIR = join("observational-memory", "reflection-drop-scores");
 
 /**
  * One scored observation from one dropper run.
@@ -50,13 +51,55 @@ export interface DropScoreRow {
 	heuristicRank: number;
 }
 
-export function dropScoresRelativePath(sessionId: string | undefined): string {
+/**
+ * One active reflection from one reflection-dropper run. Like `DropScoreRow`,
+ * it carries ids and numbers only.
+ */
+export interface ReflectionDropRow {
+	ts: string;
+	sessionId?: string;
+	reflectionId: string;
+	/** Whether the model asked to drop this reflection. */
+	proposed: boolean;
+	/** The outcome after `selectReflectionDropCandidates` applied the budget. */
+	decision: "drop" | "keep";
+	/**
+	 * Rank the orphan-count/recency sort assigns across the whole pool, lowest
+	 * first, so the model can be compared against that ordering.
+	 */
+	sortRank: number;
+	orphanCount: number;
+	activeSupportCount: number;
+	droppedSupportCount: number;
+	lastEvidenceTimestamp?: string;
+}
+
+function sessionLogRelativePath(dir: string, sessionId: string | undefined): string {
 	const safe = safeDebugLogSessionId(sessionId);
-	return join(DROP_SCORES_RELATIVE_DIR, `${safe ?? "unknown-session"}.ndjson`);
+	return join(dir, `${safe ?? "unknown-session"}.ndjson`);
+}
+
+export function dropScoresRelativePath(sessionId: string | undefined): string {
+	return sessionLogRelativePath(DROP_SCORES_RELATIVE_DIR, sessionId);
 }
 
 export function dropScoresPath(sessionId: string | undefined): string {
 	return join(getAgentDir(), dropScoresRelativePath(sessionId));
+}
+
+export function reflectionDropScoresPath(sessionId: string | undefined): string {
+	return join(getAgentDir(), sessionLogRelativePath(REFLECTION_DROP_SCORES_RELATIVE_DIR, sessionId));
+}
+
+function appendRows(path: string, rows: readonly object[]): boolean {
+	if (rows.length === 0) return false;
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		appendFileSync(path, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf-8");
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -64,15 +107,12 @@ export function dropScoresPath(sessionId: string | undefined): string {
  * the dropper does.
  */
 export function appendDropScores(sessionId: string | undefined, rows: readonly DropScoreRow[]): boolean {
-	if (rows.length === 0) return false;
-	try {
-		const path = dropScoresPath(sessionId);
-		mkdirSync(dirname(path), { recursive: true });
-		appendFileSync(path, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf-8");
-		return true;
-	} catch {
-		return false;
-	}
+	return appendRows(dropScoresPath(sessionId), rows);
+}
+
+/** Append one reflection-dropper run. Never throws, for the same reason. */
+export function appendReflectionDropScores(sessionId: string | undefined, rows: readonly ReflectionDropRow[]): boolean {
+	return appendRows(reflectionDropScoresPath(sessionId), rows);
 }
 
 /** Read back every row for a session, skipping any line that is not valid JSON. */
