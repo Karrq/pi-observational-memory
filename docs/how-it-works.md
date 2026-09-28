@@ -228,6 +228,8 @@ It does only deterministic work:
 6. If the summary is empty, return no extension result so Pi uses native compaction.
 7. Otherwise return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
 
+The returned `firstKeptEntryId` can be earlier than Pi's. When source entries before Pi's cut are not yet covered by observations, the hook moves the cut back to the nearest valid cut point before the first unobserved entry, so that range stays in the retained tail instead of disappearing until the next compaction. It never cuts before the previous compaction entry and keeps Pi's cut when the extended tail would exceed half of `compactAfterTokens`. The projection still uses Pi's cut.
+
 It does not:
 
 - call a model;

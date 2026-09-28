@@ -27,6 +27,7 @@ function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number;
 	const runtime = {
 		config: {
 			observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
+			compactAfterTokens: 81_000,
 		},
 		compactHookInFlight: args.compactHookInFlight ?? false,
 		observerPromise: new Promise(() => {}),
@@ -81,6 +82,22 @@ describe("V3 compaction hook", () => {
 		expect(result.compaction.details.reflections).toEqual([]);
 		expect(result.compaction.summary).toContain("## Observations");
 		expect(result.compaction.summary).not.toContain("## Reflections");
+	});
+
+	it("retains entries the observer has not covered while still rendering covered observations", async () => {
+		const obs1 = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [obs1], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbb"),
+			textCustomMessage("raw-3", "cccc"),
+		];
+		const { run } = setup({ entries, observationsPoolMaxTokens: 100 });
+
+		const result = await run("raw-3") as any;
+
+		expect(result.compaction.firstKeptEntryId).toBe("raw-2");
+		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa"]);
 	});
 
 	it("writes a normal V3 projection without applying new reflections or drops", async () => {
