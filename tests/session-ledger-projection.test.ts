@@ -101,6 +101,22 @@ describe("session-ledger V3 projections", () => {
 		expect(result.details).toMatchObject({ type: "om.folded", version: 1, fullFold: false });
 	});
 
+	it("compaction keeps observations citing dropped entries from a batch covering past the cut", () => {
+		const before = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"] });
+		const spanning = observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-1", "raw-2"] });
+		const after = observation("cccccccccccc", { sourceEntryIds: ["raw-2"] });
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			textCustomMessage("raw-2", "bbbb"),
+			textCustomMessage("raw-3", "cccc"),
+			observationsRecordedEntry("om-aaaaaaaaaaaa", { observations: [before, spanning, after], coversUpToId: "raw-3" }),
+		];
+
+		const result = buildCompactionProjection(entries, "raw-2", { observationsPoolMaxTokens: 100 });
+
+		expect(result.observations.map((obs) => obs.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+	});
+
 	it("normal compaction projection includes current observations but keeps reflections and drops at latest full-fold boundary", () => {
 		const obs1 = observation("aaaaaaaaaaaa", { tokenCount: 5 });
 		const obs2 = observation("bbbbbbbbbbbb", { tokenCount: 5 });

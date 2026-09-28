@@ -217,6 +217,48 @@ export function realTokensSinceAnchor(
 	return Math.max(0, currentContextTokens);
 }
 
+// Mirrors Pi's compaction cut rule: any context message except a tool result,
+// which must stay behind its tool call.
+function isCutPointEntry(entry: Entry): boolean {
+	if (entry.type === "custom_message" || entry.type === "branch_summary") return true;
+	if (entry.type !== "message" || !isObject(entry.message)) return false;
+	return entry.message.role !== "toolResult";
+}
+
+/**
+ * Pull a compaction cut back so source entries the observer has not covered
+ * yet stay in the retained tail instead of vanishing until a later compaction.
+ * Returns `proposedId` when nothing is unobserved before it, when no safe cut
+ * exists after the previous compaction, or when the extended tail would exceed
+ * `maxRetainedTokens`.
+ */
+export function coverageSafeFirstKeptEntryId(
+	entries: Entry[],
+	proposedId: string,
+	maxRetainedTokens: number,
+): string {
+	const proposedIndex = entryIndexForId(entries, proposedId);
+	if (proposedIndex === -1) return proposedId;
+
+	const coverageIndex = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	let firstUnobserved = -1;
+	for (let i = coverageIndex + 1; i < proposedIndex; i++) {
+		if (isSourceEntry(entries[i])) {
+			firstUnobserved = i;
+			break;
+		}
+	}
+	if (firstUnobserved === -1) return proposedId;
+
+	// Cutting before an earlier compaction entry would replay its summary.
+	const floor = findLastCompactionIndex(entries.slice(0, proposedIndex));
+	for (let i = firstUnobserved; i > floor; i--) {
+		if (!isCutPointEntry(entries[i])) continue;
+		return rawTokensAfterIndex(entries, i - 1) <= maxRetainedTokens ? entries[i].id : proposedId;
+	}
+	return proposedId;
+}
+
 export function rawTokensSinceLastCompaction(entries: Entry[]): number {
 	const compactionIndex = findLastCompactionIndex(entries);
 	if (compactionIndex === -1) return rawTokensAfterIndex(entries, -1);

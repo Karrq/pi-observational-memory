@@ -78,7 +78,7 @@ Every V3 ledger entry has `data.coversUpToId`. That field is a progress and proj
 | Dropper | latest `om.observations.dropped.data.coversUpToId` |
 | Auto-compaction | latest compaction boundary |
 
-The watermark is also used to decide whether a memory ledger entry belongs to a bounded projection. It is not provenance. Provenance lives in `sourceEntryIds` and `supportingObservationIds`.
+The watermark is also used to decide whether a memory ledger entry belongs to a bounded projection; for observations, citing a source entry before the boundary also qualifies. It is not provenance. Provenance lives in `sourceEntryIds` and `supportingObservationIds`.
 
 ## Ledger data shapes
 
@@ -228,6 +228,8 @@ It does only deterministic work:
 6. If the summary is empty, return no extension result so Pi uses native compaction.
 7. Otherwise return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
 
+The returned `firstKeptEntryId` can be earlier than Pi's. When source entries before Pi's cut are not yet covered by observations, the hook moves the cut back to the nearest valid cut point before the first unobserved entry, so that range stays in the retained tail instead of disappearing until the next compaction. It never cuts before the previous compaction entry and keeps Pi's cut when the extended tail would exceed half of `compactAfterTokens`. The projection still uses Pi's cut.
+
 It does not:
 
 - call a model;
@@ -244,7 +246,7 @@ V3 uses projection helpers so commands, compaction, and recall do not each inven
 
 ### Full projection
 
-Full projection folds valid V3 observations, reflections, and drops from branch root through the requested boundary. Memory entries are included by resolving their `data.coversUpToId` marker against the boundary, not by the physical position of the `om.*` custom entry. Old V2 entries/details, invalid V3-shaped entries, and dangling coverage markers are ignored.
+Full projection folds valid V3 observations, reflections, and drops from branch root through the requested boundary. Memory entries are included by resolving their `data.coversUpToId` marker against the boundary, not by the physical position of the `om.*` custom entry. An observation batch whose marker runs past the boundary still contributes the observations whose `sourceEntryIds` cite an entry before it, since the boundary leaves no transcript for those entries. Old V2 entries/details, invalid V3-shaped entries, and dangling coverage markers are ignored.
 
 ### Visible projection
 

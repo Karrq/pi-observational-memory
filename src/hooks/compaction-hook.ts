@@ -4,8 +4,14 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 
+import { resolveCompactAfterTokens } from "../config.js";
 import type { Runtime } from "../runtime.js";
-import { buildCompactionProjection, renderSummary, type Entry } from "../session-ledger/index.js";
+import {
+	buildCompactionProjection,
+	coverageSafeFirstKeptEntryId,
+	renderSummary,
+	type Entry,
+} from "../session-ledger/index.js";
 
 const DEFAULT_OBSERVATIONS_POOL_MAX_TOKENS = 20_000;
 
@@ -44,10 +50,19 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 				return;
 			}
 
+			// Half the trigger threshold keeps the extended tail from making the
+			// next proactive compaction due immediately.
+			const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
+			const maxRetainedTokens = Math.floor(resolveCompactAfterTokens(runtime.config, contextWindow) / 2);
+
 			return {
 				compaction: {
 					summary,
-					firstKeptEntryId,
+					firstKeptEntryId: coverageSafeFirstKeptEntryId(
+						branchEntries as Entry[],
+						firstKeptEntryId,
+						maxRetainedTokens,
+					),
 					tokensBefore,
 					details: projection.details,
 				},

@@ -81,6 +81,13 @@ function isCoveredAtOrBefore(
 	return isAtOrBefore(coverageIndex(entry, indexes), boundaryIndex);
 }
 
+function citesBefore(observation: Observation, indexes: Map<string, number>, boundaryIndex: number): boolean {
+	return observation.sourceEntryIds.some((id) => {
+		const index = indexes.get(id);
+		return index !== undefined && index < boundaryIndex;
+	});
+}
+
 function foldProjection(entries: Entry[], options: ProjectionFoldOptions): Projection {
 	const indexes = entryIndexById(entries);
 	const observationsBoundary = boundaryIndex(entries, indexes, options.observationsBoundary);
@@ -93,8 +100,13 @@ function foldProjection(entries: Entry[], options: ProjectionFoldOptions): Proje
 	const droppedObservationIds = new Set<string>();
 
 	for (const entry of entries) {
-		if (isObservationsRecordedEntry(entry) && isCoveredAtOrBefore(entry, indexes, observationsBoundary)) {
+		if (isObservationsRecordedEntry(entry)) {
+			// A batch whose coverage runs past the boundary still contributes the
+			// observations citing entries before it: the boundary drops those
+			// entries, so no retained transcript stands in for them.
+			const covered = isCoveredAtOrBefore(entry, indexes, observationsBoundary);
 			for (const observation of entry.data.observations) {
+				if (!covered && !citesBefore(observation, indexes, observationsBoundary)) continue;
 				if (observationsById.has(observation.id)) continue;
 				observationsById.add(observation.id);
 				observations.push(observation);
