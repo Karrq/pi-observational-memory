@@ -9,7 +9,17 @@ import {
 	type RecallResult,
 	type RecalledObservation,
 } from "../session-ledger/recall.js";
-import { searchSession, tokenize, type Observation, type Reflection, type SearchHit } from "../session-ledger/index.js";
+import {
+	buildSearchCorpus,
+	fuseScores,
+	rankLexical,
+	tokenize,
+	topHits,
+	type Observation,
+	type Reflection,
+	type SearchDocument,
+	type SearchHit,
+} from "../session-ledger/index.js";
 import { isSourceEntry } from "../session-ledger/progress.js";
 import { renderRecallSourceEntries, renderRecallSourceEntry } from "../serialize.js";
 import { estimateEntryTokens } from "../tokens.js";
@@ -78,6 +88,7 @@ export type RecallObservationToolDetails = {
 export type RecallSearchDetails = {
 	mode: "search";
 	query: string;
+	semantic: boolean;
 	hits: Array<Pick<SearchHit, "kind" | "id" | "score">>;
 };
 
@@ -469,9 +480,15 @@ function searchHitText(hit: SearchHit, query: string): string {
 	return `[${hit.id}] transcript ${snippet(hit.text, query)}`;
 }
 
-function searchResult(entries: Entry[], query: string) {
-	const hits = searchSession(entries, query, SEARCH_LIMIT);
-	const details: RecallSearchDetails = { mode: "search", query, hits: hits.map(({ kind, id, score }) => ({ kind, id, score })) };
+/** Optional semantic scores per document; undefined falls back to lexical ranking. */
+export type VectorScorer = (sessionId: string, docs: SearchDocument[], query: string) => Promise<Array<number | undefined> | undefined>;
+
+async function searchResult(entries: Entry[], query: string, sessionId: string, vectorScores?: VectorScorer) {
+	const docs = buildSearchCorpus(entries);
+	const lexical = rankLexical(docs, query);
+	const vector = vectorScores ? await vectorScores(sessionId, docs, query) : undefined;
+	const hits = topHits(docs, vector ? fuseScores(lexical, vector) : lexical, SEARCH_LIMIT);
+	const details: RecallSearchDetails = { mode: "search", query, semantic: vector !== undefined, hits: hits.map(({ kind, id, score }) => ({ kind, id, score })) };
 	const text = hits.length === 0
 		? `No matches for "${query}".`
 		: `${hits.map((hit) => searchHitText(hit, query)).join("\n")}\n\nPass an id to recall for full evidence.`;
@@ -490,11 +507,11 @@ function entryResult(entries: Entry[], entryId: string) {
 
 export function formatRecallSearchResultForTui(details: RecallSearchDetails): string {
 	if (details.hits.length === 0) return `\n× no matches for "${details.query}"`;
-	const rows = details.hits.map((hit) => alignedRow(`✓ ${hit.kind}`, hit.id, `score ${hit.score.toFixed(2)}`));
-	return `\n✓ ${plural(details.hits.length, "match", "matches")}\n\n${rows.join("\n")}`;
+	const rows = details.hits.map((hit) => alignedRow(`✓ ${hit.kind}`, hit.id, `score ${hit.score.toFixed(3)}`));
+	return `\n✓ ${plural(details.hits.length, "match", "matches")}${details.semantic ? " · semantic" : ""}\n\n${rows.join("\n")}`;
 }
 
-export const recallObservationTool = defineTool({
+export const createRecallTool = (vectorScores?: VectorScorer) => defineTool({
 	name: RECALL_OBSERVATION_TOOL_NAME,
 	label: "Recall memory evidence",
 	description:
@@ -529,7 +546,7 @@ export const recallObservationTool = defineTool({
 			const message = "Pass either query or id, not both.";
 			return textResult(message, emptyDetails("invalid_id", memoryId, message));
 		}
-		if (query) return searchResult(branch(), query);
+		if (query) return searchResult(branch(), query, ctx.sessionManager.getSessionId(), vectorScores);
 		if (ENTRY_ID_PATTERN.test(memoryId)) return entryResult(branch(), memoryId);
 		if (!MEMORY_ID_PATTERN.test(memoryId)) {
 			const message = `Pass query to search, or an id: 12 lowercase hex characters for memory, 8 for a transcript entry. Received: ${memoryId || "nothing"}`;
@@ -544,6 +561,8 @@ export const recallObservationTool = defineTool({
 	},
 });
 
-export function registerRecallTool(pi: ExtensionAPI): void {
-	pi.registerTool(recallObservationTool);
+export const recallObservationTool = createRecallTool();
+
+export function registerRecallTool(pi: ExtensionAPI, vectorScores?: VectorScorer): void {
+	pi.registerTool(vectorScores ? createRecallTool(vectorScores) : recallObservationTool);
 }

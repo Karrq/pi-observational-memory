@@ -75,6 +75,10 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `fallbackModel.provider` | string | unset | Provider name in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.id` | string | unset | Model id in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.thinking` | enum | unset; falls back to `model.thinking` then `low` | Optional reasoning/thinking level used when the fallback is active. |
+| `recallEmbeddings.enabled` | boolean | `false` | Adds local semantic ranking to `recall` queries. |
+| `recallEmbeddings.model` | string | `Xenova/bge-small-en-v1.5` | transformers.js feature-extraction model id. |
+| `recallEmbeddings.pooling` | `cls` \| `mean` | `cls` | Pooling the model was trained with. |
+| `recallEmbeddings.queryPrefix` | string | BGE retrieval prefix | Text prepended to queries, as the model's recipe requires. |
 | `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
@@ -212,6 +216,16 @@ Once the fallback resolves, it is reused for the rest of the consolidation pass,
 If the fallback advertises a smaller context window than the primary, the observer chunk is capped to the smaller window before the run, so a fallback retry is never handed a prompt sized only for a larger primary. `fallbackModel.thinking`, when set, is the thinking level used for the fallback call.
 
 `provider` and `id` must both be non-empty strings, exactly as for `model`. A `fallbackModel` identical to the effective primary memory model — the configured `model` when it resolves, otherwise the session model — is rejected as a misconfiguration. A fallback that also fails leaves the existing skip/fail-safe behavior intact: no memory is invented, coverage does not advance, and the failure is surfaced (worker failure notification, `/om:status`, debug log).
+
+## `recallEmbeddings`
+
+Default: `{ "enabled": false }`.
+
+When enabled, `recall` queries fuse keyword ranking with semantic similarity (reciprocal rank fusion over the top 50 semantic candidates). This finds matches that share no words with the query. The model runs in-process through the optional `@huggingface/transformers` dependency. No embedding API is called. The weights download once into `observational-memory/models` under Pi's agent directory. The default model is about 33 MB.
+
+Indexing runs in the background at session start and after each agent run. It embeds memory and hidden transcript chunks that have no vector yet, and stores the vectors per session under `observational-memory/embeddings`. Queries never wait for indexing. Documents not embedded yet compete on keyword rank alone. A long session with a few thousand chunks takes about a minute of CPU the first time. If the runtime or model cannot load, recall falls back to keyword search and shows one warning.
+
+Changing `model` rebuilds the index, because stored vectors are tied to the model. Set `pooling` and `queryPrefix` to match the new model. For `Xenova/all-MiniLM-L6-v2`, use `"pooling": "mean"` and `"queryPrefix": ""`.
 
 ## `showWorkerNotifications`
 

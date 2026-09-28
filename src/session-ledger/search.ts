@@ -128,6 +128,33 @@ export function rankLexical(docs: SearchDocument[], query: string): number[] {
 	});
 }
 
+/** Semantic candidates admitted to fusion; the long tail of any embedding space is noise. */
+export const VECTOR_CANDIDATES = 50;
+const RRF_K = 60;
+
+function ranksOf(scores: Array<number | undefined>, limit: number): Map<number, number> {
+	const order = scores
+		.map((score, i) => ({ score, i }))
+		.filter((item): item is { score: number; i: number } => item.score !== undefined && item.score > 0)
+		.sort((a, b) => b.score - a.score)
+		.slice(0, limit);
+	return new Map(order.map((item, rank) => [item.i, rank]));
+}
+
+/**
+ * Reciprocal rank fusion of lexical and vector scores. Documents without a
+ * vector yet (still indexing) compete on lexical rank alone.
+ */
+export function fuseScores(lexical: number[], vector: Array<number | undefined>): number[] {
+	const lexicalRanks = ranksOf(lexical, lexical.length);
+	const vectorRanks = ranksOf(vector, VECTOR_CANDIDATES);
+	return lexical.map((_, i) => {
+		const l = lexicalRanks.get(i);
+		const v = vectorRanks.get(i);
+		return (l === undefined ? 0 : 1 / (RRF_K + l)) + (v === undefined ? 0 : 1 / (RRF_K + v));
+	});
+}
+
 /** Highest-scoring documents, keeping only the best chunk of each transcript entry. */
 export function topHits(docs: SearchDocument[], scores: number[], limit: number): SearchHit[] {
 	const ranked = docs

@@ -30,6 +30,25 @@ export interface ConfiguredModel {
  */
 export type CompactAfterTokensMode = "calibrated" | "ratio";
 
+/**
+ * Local semantic ranking for `recall` queries. The model runs in-process
+ * through transformers.js; weights download once into Pi's agent directory.
+ * `pooling` and `queryPrefix` must match the model's training recipe.
+ */
+export interface RecallEmbeddingsConfig {
+	enabled: boolean;
+	model: string;
+	pooling: "cls" | "mean";
+	queryPrefix: string;
+}
+
+export const RECALL_EMBEDDINGS_DEFAULTS: Readonly<RecallEmbeddingsConfig> = {
+	enabled: false,
+	model: "Xenova/bge-small-en-v1.5",
+	pooling: "cls",
+	queryPrefix: "Represent this sentence for searching relevant passages: ",
+};
+
 export interface Config {
 	observeAfterTokens: number;
 	reflectAfterTokens: number;
@@ -70,6 +89,7 @@ export interface Config {
 	 */
 	fallbackModel?: ConfiguredModel;
 	showWorkerNotifications: boolean;
+	recallEmbeddings: RecallEmbeddingsConfig;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -85,6 +105,7 @@ export const DEFAULTS: Config = {
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
+	recallEmbeddings: { ...RECALL_EMBEDDINGS_DEFAULTS },
 	passive: false,
 	debugLog: false,
 };
@@ -203,6 +224,17 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	return model;
 }
 
+/** Malformed fields fall back to defaults; a non-object block is ignored. */
+export function normalizeRecallEmbeddings(value: unknown): RecallEmbeddingsConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	return {
+		enabled: value.enabled === true,
+		model: nonEmptyString(value.model) ?? RECALL_EMBEDDINGS_DEFAULTS.model,
+		pooling: value.pooling === "cls" || value.pooling === "mean" ? value.pooling : RECALL_EMBEDDINGS_DEFAULTS.pooling,
+		queryPrefix: typeof value.queryPrefix === "string" ? value.queryPrefix : RECALL_EMBEDDINGS_DEFAULTS.queryPrefix,
+	};
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -215,6 +247,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;
+	const recallEmbeddings = normalizeRecallEmbeddings(value.recallEmbeddings);
+	if (recallEmbeddings) normalized.recallEmbeddings = recallEmbeddings;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;

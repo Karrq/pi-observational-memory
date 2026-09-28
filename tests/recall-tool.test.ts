@@ -24,7 +24,7 @@ function fakeCtx(entries: TestEntry[]) {
 	const getEntries = vi.fn(() => {
 		throw new Error("recall tool must not use getEntries");
 	});
-	return { ctx: { sessionManager: { getBranch, getEntries } }, getBranch, getEntries };
+	return { ctx: { sessionManager: { getBranch, getEntries, getSessionId: () => "session-1" } }, getBranch, getEntries };
 }
 
 async function execute(id: string | { id?: string; query?: string }, entries: TestEntry[]) {

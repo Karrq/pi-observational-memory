@@ -48,5 +48,8 @@
     "typebox": "^1.1.38",
     "typescript": "^5.6.0",
     "vitest": "^4.1.5"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.3.0"
   }
 }
