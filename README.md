@@ -323,6 +323,41 @@ Set `fallbackModel` when the memory model may be unavailable: it is tried when t
 
 Set `showWorkerNotifications` to `false` to hide routine worker start and completion messages (including deliberate-empty observer info messages). Model fallback/unavailability, worker failures (including observer stream errors), compaction notifications, and explicit `/om:*` command output remain visible.
 
+### Routing the memory-worker model by active session model (local patch)
+
+`modelMap` selects the memory-worker model based on the active session model, matched by glob against `"<provider>/<id>"`. The first matching entry wins; if none match, `model` (or the session model) is used as before.
+
+```json
+{
+  "observational-memory": {
+    "modelMap": [
+      { "match": "claude-bridge/claude-opus-*", "provider": "claude-bridge", "id": "claude-sonnet-5" },
+      { "match": "synthetic/syn:large:*", "provider": "synthetic", "id": "syn:small:text" }
+    ]
+  }
+}
+```
+
+Each entry may also set `thinking`.
+
+An entry may set `stages` to narrow it to any of `observer`, `reflector`, `dropper`, so the cheap extraction stages and the expensive distillation stage can use different models. An entry without `stages` serves every stage, so order a stage-specific entry before the general one:
+
+```json
+{
+  "observational-memory": {
+    "reflectAfterTokens": 50000,
+    "modelMap": [
+      { "match": "*", "stages": ["reflector"], "provider": "claude-bridge", "id": "claude-sonnet-5", "thinking": "high" },
+      { "match": "*", "provider": "synthetic", "id": "syn:small:text" }
+    ]
+  }
+}
+```
+
+Stage names are validated: an entry whose `stages` contains no recognized stage is discarded rather than treated as unrestricted, so a misspelled stage cannot silently route the reflector's model to every stage. Each stage resolves its model independently, once per consolidation run.
+
+This is a local patch (`src/config.ts`, `src/runtime.ts`, `src/hooks/consolidation-trigger.ts`) on top of upstream `master` and is not part of the published package.
+
 `observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max.
 
 Dropper pruning balances age, relevance, and reflection coverage. Relevance is importance/resistance, not a permanent active-memory pin: `critical` observations require the strongest evidence but can be dropped when they are older and safely represented by reflections, superseded by newer memory, redundant, or obsolete. Dropper input annotates each active observation with deterministic coverage evidence: `none`, `partial`, or `strong`; coverage guides model judgment and is not an automatic drop rule. Dropping removes observations from active memory, not ledger history.

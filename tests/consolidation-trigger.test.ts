@@ -87,7 +87,7 @@ function setup(args: {
 		lastReflectorError: undefined as string | undefined,
 		lastDropperError: undefined as string | undefined,
 		ensureConfig: vi.fn(),
-		resolveModel: vi.fn(async () => ({ ok: true, model: { reasoning: true }, apiKey: "key", headers: { h: "v" } })),
+		resolveModel: vi.fn(async () => ({ ok: true, model: { reasoning: true }, apiKey: "key", headers: { h: "v" }, thinking: "minimal" })),
 		resolveFallbackModel: vi.fn(async () => ({ ok: false, reason: "no fallback model configured" })),
 		launchConsolidationTask: vi.fn((_ctx, work) => {
 			runtime.consolidationInFlight = true;
