@@ -63,7 +63,7 @@ const AVAILABILITY_RECHECK_REARM_MS = 60_000;
 
 type NotifyLevel = "warning" | "info" | "error";
 type Notify = (message: string, type?: NotifyLevel) => void;
-export type ConsolidationPhase = "observer" | "reflector" | "dropper";
+export type ConsolidationPhase = "observer" | "reflector" | "reflection-dropper" | "dropper";
 
 /**
  * Whether pi positively reports a working credential source for this model's provider.
@@ -123,6 +123,7 @@ export class Runtime {
 	resolveFailureNotified = false;
 	lastObserverError: string | undefined;
 	lastReflectorError: string | undefined;
+	lastReflectionDropperError: string | undefined;
 	lastDropperError: string | undefined;
 	/** provider -> epoch ms of the last availability re-check (see `recheckProviderCredential`). */
 	availabilityRecheckedAt = new Map<string, number>();
@@ -370,6 +371,7 @@ export class Runtime {
 		this.consolidationPhase = undefined;
 		this.lastObserverError = undefined;
 		this.lastReflectorError = undefined;
+		this.lastReflectionDropperError = undefined;
 		this.lastDropperError = undefined;
 		const promise = this.launchTrackedTask(ctx, "consolidation", work, () => {
 			this.consolidationInFlight = false;
@@ -384,6 +386,7 @@ export class Runtime {
 		const message = error instanceof Error ? error.message : String(error);
 		if (phase === "observer") this.lastObserverError = message;
 		if (phase === "reflector") this.lastReflectorError = message;
+		if (phase === "reflection-dropper") this.lastReflectionDropperError = message;
 		if (phase === "dropper") this.lastDropperError = message;
 		if (ctx.hasUI && ctx.ui) ctx.ui.notify(`Observational memory: ${phase} failed: ${message}`, "warning");
 		return message;

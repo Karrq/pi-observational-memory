@@ -30,7 +30,8 @@ export function droppableObservationCount(observations: readonly Observation[]):
 	return observations.length;
 }
 
-export function maxDropCountForPool(observations: readonly Observation[], observationTokens: number, targetTokens: number): number {
+// `items` is only counted, never read, so the reflection pool reuses this math.
+export function maxDropCountForPool(observations: readonly unknown[], observationTokens: number, targetTokens: number): number {
 	const activeObservationCount = observations.length;
 	if (activeObservationCount === 0) return 0;
 	if (!Number.isFinite(observationTokens) || observationTokens <= 0) return 0;

@@ -10,12 +10,14 @@ import {
 	rawTokensAfterIndex,
 	rawTokensSinceDropCoverage,
 	rawTokensSinceLastCompaction,
+	rawTokensSinceReflectionDropCoverage,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
 } from "../src/session-ledger/index.js";
 import {
 	V3_OBSERVATIONS_DROPPED,
 	V3_OBSERVATIONS_RECORDED,
+	V3_REFLECTIONS_DROPPED,
 	V3_REFLECTIONS_RECORDED,
 	branchSummary,
 	compactionEntry,
@@ -24,6 +26,7 @@ import {
 	observationsRecordedEntry,
 	oldV2ObservationEntry,
 	reflection,
+	reflectionsDroppedEntry,
 	reflectionsRecordedEntry,
 	rawMessage,
 	textCustomMessage,
@@ -142,6 +145,50 @@ describe("session-ledger V3 progress helpers", () => {
 		];
 
 		expect(rawTokensSinceLastCompaction(entries)).toBe(3); // raw-1 + raw-2 from live tail starting at firstKeptEntryId
+	});
+	it("tracks a reflection-drop coverage clock independent of observation drops", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-3", "cccccccccccc"),
+		];
+
+		expect(latestCoverageMarkerId(entries, V3_REFLECTIONS_DROPPED)).toBe("raw-1");
+		expect(latestCoverageIndex(entries, V3_REFLECTIONS_DROPPED)).toBe(0);
+		expect(rawTokensSinceReflectionDropCoverage(entries)).toBe(5); // raw-2 + raw-3
+		expect(latestCoverageMarkerId(entries, V3_OBSERVATIONS_DROPPED)).toBeUndefined();
+	});
+
+	it("rejects reflection-drop entries whose id list is empty", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: [], coversUpToId: "raw-1" }),
+		];
+
+		expect(latestCoverageMarkerId(entries, V3_REFLECTIONS_DROPPED)).toBeUndefined();
+	});
+
+	it("does not confuse observation-drop and reflection-drop coverage shapes", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsDroppedEntry("om-drop", { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }),
+		];
+
+		expect(latestCoverageMarkerId(entries, V3_OBSERVATIONS_DROPPED)).toBe("raw-1");
+		expect(latestCoverageMarkerId(entries, V3_REFLECTIONS_DROPPED)).toBeUndefined();
+	});
+
+	it("keeps reflection-drop entries out of raw source progress", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-1" }),
+		];
+
+		expect(rawTokensAfterIndex(entries, 0)).toBe(0);
+		expect(isSourceEntry(entries[1])).toBe(false);
 	});
 });
 

@@ -35,6 +35,7 @@ The extension loads config once for its runtime. After changing settings, restar
     "compactAfterTokens": 81000,
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
+    "reflectionsPoolTargetTokens": 8000,
     "agentMaxTurns": 16,
     "model": {
       "provider": "openrouter",
@@ -65,9 +66,10 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `compactAfterTokens` | positive integer | `81000` | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
 | `observationsPoolMaxTokens` | positive integer | `20000` | Normal compaction-projection observation-token pressure that makes compaction do a full fold. |
 | `observationsPoolTargetTokens` | positive integer below max | half of `observationsPoolMaxTokens` | Folded active observation target used by post-reflection dropper maintenance. |
-| `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, and dropper. |
+| `reflectionsPoolTargetTokens` | positive integer | `8000` | Folded active reflection target used by the reflection dropper. |
+| `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, reflection dropper, and dropper. |
 | `agentMaxTokens` | positive integer | `32000` | Maximum output tokens requested for memory-agent loops. Clamped to the model's own `maxTokens` when available. Lower it for local servers with a modest context window. |
-| `model` | object | unset | Optional model override for observer, reflector, and dropper. |
+| `model` | object | unset | Optional model override for observer, reflector, reflection dropper, and dropper. |
 | `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
 | `model.id` | string | unset | Model id in Pi's model registry. Required when `model` is set. |
 | `model.thinking` | enum | unset; workers fall back to `low` | Optional reasoning/thinking level for memory workers. |
@@ -81,13 +83,13 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `recallEmbeddings.model` | string | `Xenova/bge-small-en-v1.5` | transformers.js feature-extraction model id. |
 | `recallEmbeddings.pooling` | `cls` \| `mean` | `cls` | Pooling the model was trained with. |
 | `recallEmbeddings.queryPrefix` | string | BGE retrieval prefix | Text prepended to queries, as the model's recipe requires. |
-| `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
+| `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, reflection dropper, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
 
 Valid `model.thinking` values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 
-Invalid values are ignored. Positive-integer settings must be finite integers greater than zero. `observationsPoolTargetTokens` must also be below `observationsPoolMaxTokens`; if omitted or invalid, it is derived as `Math.floor(observationsPoolMaxTokens / 2)`.
+Invalid values are ignored. Positive-integer settings must be finite integers greater than zero. `observationsPoolTargetTokens` must also be below `observationsPoolMaxTokens`; if omitted or invalid, it is derived as `Math.floor(observationsPoolMaxTokens / 2)`. An omitted or invalid `reflectionsPoolTargetTokens` falls back to its default.
 
 ## `observeAfterTokens`
 
@@ -146,6 +148,30 @@ When the dropper runs, it computes how many tokens are over target, converts tha
 Dropper input includes deterministic reflection coverage evidence for every active observation: `none` means no current reflection supports the observation id, `partial` means one reflection supports it, and `strong` means two or more reflections support it. Coverage is evidence for the model, not an automatic drop rule. Relevance is importance/resistance rather than an absolute lock: `critical` observations require the strongest evidence, but older covered/superseded critical observations may leave active memory when semantic safety is clear. Dropping does not delete ledger history; known ids remain recallable.
 
 This target does not affect compaction full-fold pressure. Visible compaction pressure remains based on `observationsPoolMaxTokens`.
+
+## `reflectionsPoolTargetTokens`
+
+Default: `8000`.
+
+This bounds the durable layer. Reflections are re-rendered into every compacted context, so without a target they accumulate for the life of a session and become a permanent tax on every context after compaction.
+
+The reflection dropper runs when the reflector clock is due and folded active reflection tokens are over this target. It deliberately does not require same-run reflector output: reflections go stale exactly when the session moves to new work, which is when the reflector has nothing new to record.
+
+Pool tokens are measured from the rendered line (`[id] content`), not the stored `tokenCount`, because the id prefix is part of what every future context pays for.
+
+The maximum drop count is derived the same way as for observations: tokens over target converted to an approximate reflection count, passed to the model as a hard upper bound. The model may drop fewer or none. Effort scales with pressure while the safety bar does not: a pool far over target tells the dropper to work the whole candidate list rather than stopping after the obvious few, but every individual drop still has to be clearly superseded, obsolete, or redundant.
+
+Like the observer, the reflector is not told about pool pressure. Both producers emit on the merits of what they see, and each pool is bounded by its own dropper.
+
+Reflections carry no timestamp, so the dropper annotates each candidate with deterministic evidence derived from its supporting observations:
+
+- **last evidence** — timestamp of the newest supporting observation, including observations already dropped from active memory. This dates the reflection's evidence, not its importance.
+- **support** — how many supporting observations are still active versus dropped.
+- **orphan risk** — supporting observations that are already dropped and cited by no other active reflection. Those observations were pruned because this reflection preserved their meaning, so dropping it would remove that meaning from active memory entirely. Code ranks orphan-free candidates ahead of orphan-risk candidates, then prefers older evidence.
+
+Reflection drops are tombstones, not deletions: dropped reflections stay recallable by id. Because a reflection id is a hash of its content, a tombstone is permanent for that exact wording, so the reflector treats tombstoned ids as duplicates rather than re-recording them.
+
+This target does not affect compaction full-fold pressure, which remains based on `observationsPoolMaxTokens` and counts observation tokens only.
 
 ## `agentMaxTurns`
 
@@ -261,7 +287,7 @@ When `false`, the extension hides routine observer, reflector, and dropper progr
 
 Default: `false`.
 
-When `true`, the extension does not proactively run the observer, reflector/dropper lane, or auto-compaction trigger. Manual/Pi compaction hooks, `/om:status`, `/om:view`, and `recall` remain available.
+When `true`, the extension does not proactively run the observer, reflector/dropper lane, or auto-compaction trigger. Manual/Pi compaction hooks, `/om:status`, `/om:view`, `/om:consolidate`, and `recall` remain available. Passive disables scheduled work, not explicit commands, so `/om:consolidate` is how you keep memory current in a passive session.
 
 Environment override:
 
@@ -291,7 +317,7 @@ Contexts without a usable session id fall back to the legacy global file:
 observational-memory/debug.ndjson
 ```
 
-Each row includes event metadata such as `sessionId`, `sessionFile`, `runId`, `cwd`, and event-specific `data`. `runId` identifies one consolidation pipeline inside a session file, so you can filter a session log to a single observer/reflector/dropper pass.
+Each row includes event metadata such as `sessionId`, `sessionFile`, `runId`, `cwd`, and event-specific `data`. `runId` identifies one consolidation pipeline inside a session file, so you can filter a session log to a single observer/reflector/dropper pass. Automatic runs use a `consolidation-` prefix and `/om:consolidate` runs use a `manual-` prefix.
 
 Dropper diagnostics are especially useful when the active observation pool is over target but no drops are appended. For example:
 
@@ -300,6 +326,14 @@ grep '"event":"dropper' ~/.pi/agent/observational-memory/debug/<session-id>.ndjs
 ```
 
 Look for `dropper.result`: `no_tool_call` means the model chose not to drop anything, `all_filtered` means proposed ids were unusable, and `selected_nonempty` means usable drops were selected before append handling.
+
+Reflection-dropper events use the `reflection_dropper.` prefix and the same `result` reasons, plus `reflector_not_due` and `not_ready` when the stage is skipped:
+
+```bash
+grep '"event":"reflection_dropper' ~/.pi/agent/observational-memory/debug/<session-id>.ndjson | tail -n 50
+```
+
+`reflection_dropper.agent_start` also carries an `evidenceSummary` with orphan-risk and support-id totals for the whole pool.
 
 Debug logs are opt-in local debugging artifacts. By default, diagnostic events should record aggregate counts, token totals, ids, file paths, errors, and project details rather than observation/reflection content, prompts, model responses, or raw model-proposed drop ids. Treat debug files as sensitive local artifacts.
 

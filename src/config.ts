@@ -43,10 +43,10 @@ export interface LegacyCompactThresholdSettings {
 	compactAfterTokensRatio?: number;
 }
 
-/** The three memory-worker stages, each resolved independently. */
-export type MemoryStage = "observer" | "reflector" | "dropper";
+/** The memory-worker stages, each resolved independently. */
+export type MemoryStage = "observer" | "reflector" | "reflection-dropper" | "dropper";
 
-export const MEMORY_STAGE_VALUES: readonly MemoryStage[] = ["observer", "reflector", "dropper"] as const;
+export const MEMORY_STAGE_VALUES: readonly MemoryStage[] = ["observer", "reflector", "reflection-dropper", "dropper"] as const;
 
 /**
  * A glob-matched routing rule for the memory-worker model.
@@ -108,6 +108,8 @@ export interface Config {
 	compactAfterTokens: number | TokenThreshold;
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
+	/** Active reflection-token budget maintained by the reflection dropper. */
+	reflectionsPoolTargetTokens: number;
 	agentMaxTurns: number;
 	/**
 	 * Maximum output tokens requested for background memory-agent loops
@@ -157,6 +159,7 @@ export const DEFAULTS: Config = {
 	compactAfterTokens: THRESHOLD_FALLBACKS.compactAfterTokens,
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
+	reflectionsPoolTargetTokens: 8_000,
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
@@ -443,6 +446,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"observerChunkMaxTokens",
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
+		"reflectionsPoolTargetTokens",
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;

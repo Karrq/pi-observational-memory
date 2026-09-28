@@ -89,6 +89,8 @@ Examples:
 
 Reflections help the agent stay oriented over time. The reflector treats coverage as stewardship: every active observation it reviews includes a `none`, `partial`, or `strong` coverage tier, but those tiers are review context rather than quotas. When the reflector emits a durable reflection, its support ids should cover all and only the observations whose durable meaning is actually preserved, because those ids later become dropper coverage evidence.
 
+Reflections are also bounded. Facts about you and your project stay durable, but a reflection about a specific task, bug, or migration stops being orientation once that work is done and the session moves on. The reflection dropper removes superseded, contradicted, closed-scope, and redundant reflections so the durable layer does not grow for the life of the session.
+
 Together, observations and reflections let Pi carry the important parts of the session forward without depending on fragile summary chains.
 
 ---
@@ -212,6 +214,7 @@ A typical config:
     "compactAfterTokens": { "type": "calibrated", "value": 81000 },
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
+    "reflectionsPoolTargetTokens": 8000,
     "agentMaxTurns": 16,
     "model": {
       "provider": "openrouter",
@@ -299,11 +302,12 @@ still parsed and map onto the ratio object form.
 | `compactAfterTokens`        | `81000`       | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. Accepts a number or threshold object. |
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
+| `reflectionsPoolTargetTokens` | `8000`      | Active reflection target maintained by the reflection dropper.                                    |
 | `agentMaxTurns`             | `16`          | Shared turn cap for background memory-agent loops.                                                |
 | `agentMaxTokens`            | `32000`       | Maximum output tokens requested for memory-agent loops (observer/reflector/dropper), clamped to the model's own `maxTokens` when available. Lower it for local servers with a modest context window, e.g. `8192`. |
 | `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
 | `fallbackModel`             | unset         | Optional second memory-worker model: `{ provider, id, thinking }`. Used when the primary memory model fails to resolve, and to retry a worker stage once when its model call errors. |
-| `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, and dropper progress notifications. Warnings and errors are unaffected. |
+| `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, reflection dropper, and dropper progress notifications. Warnings and errors are unaffected. |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
 | `debugLog`                  | `false`       | Writes opt-in per-session extension debug events to Pi's agent directory.                         |
 
@@ -340,7 +344,7 @@ Set `showWorkerNotifications` to `false` to hide routine worker start and comple
 
 Each entry may also set `thinking`.
 
-An entry may set `stages` to narrow it to any of `observer`, `reflector`, `dropper`, so the cheap extraction stages and the expensive distillation stage can use different models. An entry without `stages` serves every stage, so order a stage-specific entry before the general one:
+An entry may set `stages` to narrow it to any of `observer`, `reflector`, `reflection-dropper`, `dropper`, so the cheap extraction stages and the expensive distillation stage can use different models. An entry without `stages` serves every stage, so order a stage-specific entry before the general one:
 
 ```json
 {
@@ -362,6 +366,8 @@ This is a local patch (`src/config.ts`, `src/runtime.ts`, `src/hooks/consolidati
 
 Dropper pruning balances age, relevance, and reflection coverage. Relevance is importance/resistance, not a permanent active-memory pin: `critical` observations require the strongest evidence but can be dropped when they are older and safely represented by reflections, superseded by newer memory, redundant, or obsolete. Dropper input annotates each active observation with deterministic coverage evidence: `none`, `partial`, or `strong`; coverage guides model judgment and is not an automatic drop rule. Dropping removes observations from active memory, not ledger history.
 
+`reflectionsPoolTargetTokens` bounds the durable layer the same way. Reflections are re-rendered into every compacted context, so an unbounded reflection pool becomes a permanent tax on every context after compaction. The reflection dropper runs when the reflector clock is due and the active reflection pool is over target, and it does not wait for same-run reflector output: reflections go stale exactly when the session moves to new work, which is when the reflector has nothing new to record. It drops only superseded, contradicted, closed-scope, or redundant reflections, and never edits or merges them. Each candidate is annotated with deterministic evidence derived from its supporting observations: last evidence time, active/dropped support counts, and orphan risk (supporting observations already dropped from active memory that no other active reflection carries). Dropped reflections stay recallable by id.
+
 When `debugLog` is enabled, debug events are written as local NDJSON files under Pi's agent directory. Normal sessions write to `observational-memory/debug/<session-id>.ndjson`; contexts without a session id fall back to `observational-memory/debug.ndjson`. Debug rows include `sessionId` and per-consolidation `runId`, so a session file can still be filtered to one observer/reflector/dropper run.
 
 For details and tuning guidance, see [`docs/configuration.md`](docs/configuration.md).
@@ -372,9 +378,10 @@ For details and tuning guidance, see [`docs/configuration.md`](docs/configuratio
 
 | Surface             | What it does                                                                                                                                    |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/om:status`        | Shows memory counts, plain `+N` / `-N` visible/full drift suffixes, progress clocks, visible and active observation pool pressure, passive/in-flight state, and last worker errors. |
+| `/om:status`        | Shows memory counts, plain `+N` / `-N` visible/full drift suffixes, progress clocks, visible and active observation pool pressure, visible and active reflection pool pressure, passive/in-flight state, and last worker errors. |
 | `/om:view`          | Shows current visible memory and attempts to copy the rendered memory text to the clipboard.                                                   |
 | `/om:view full`     | Shows the full current memory state for the branch and attempts to copy the rendered memory text to the clipboard.                             |
+| `/om:consolidate`   | Runs observation, reflection, and pruning now, ignoring token thresholds. Works in passive mode. Blocks with a footer spinner showing the running stage, then reports what changed. |
 | `recall` agent tool | Searches observations, reflections, and transcript hidden by compaction by keyword, or recovers source evidence for a memory id (12 hex) or transcript entry id (8 hex) on the current branch. |
 
 `/om:view` copies only the rendered memory content. The success/failure line shown in Pi is not included in the clipboard text. If clipboard support is unavailable, the command still prints the memory view and shows a warning. Before the first V3 compaction, visible memory can be empty because nothing has been folded into `om.folded` details; use `/om:view full` to inspect recorded branch memory.
@@ -388,6 +395,7 @@ flowchart TD
     Turn[turn_end]
     Observe[Capture observations]
     Reflect[Distill reflections]
+    Prune[Prune stale reflections]
     AgentSettled[agent_settled]
     Trigger[auto-compaction trigger]
     Compact[session_before_compact]
@@ -395,6 +403,7 @@ flowchart TD
 
     Turn -->|observation due| Observe
     Turn -->|reflection due| Reflect
+    Reflect -->|reflection pool over target| Prune
     AgentSettled -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
 ```
 

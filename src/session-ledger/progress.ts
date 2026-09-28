@@ -2,6 +2,7 @@ import { estimateEntryTokens } from "../tokens.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 	OM_SELF_COMPACT_WARNING,
 	type Entry,
@@ -41,7 +42,8 @@ function isValidCoverageEntry(entry: Entry, customType: V3MemoryCustomType): ent
 
 	if (customType === OM_OBSERVATIONS_RECORDED) return isNonEmptyArray(entry.data.observations);
 	if (customType === OM_REFLECTIONS_RECORDED) return isNonEmptyArray(entry.data.reflections);
-	return isNonEmptyArray(entry.data.observationIds);
+	if (customType === OM_OBSERVATIONS_DROPPED) return isNonEmptyArray(entry.data.observationIds);
+	return isNonEmptyArray(entry.data.reflectionIds);
 }
 
 export function latestCoverageIndex(entries: Entry[], customType: V3MemoryCustomType): number {
@@ -110,6 +112,10 @@ export function rawTokensSinceReflectionCoverage(entries: Entry[]): number {
 
 export function rawTokensSinceDropCoverage(entries: Entry[]): number {
 	return rawTokensSinceCoverage(entries, OM_OBSERVATIONS_DROPPED);
+}
+
+export function rawTokensSinceReflectionDropCoverage(entries: Entry[]): number {
+	return rawTokensSinceCoverage(entries, OM_REFLECTIONS_DROPPED);
 }
 
 export function findLastCompactionIndex(entries: Entry[]): number {

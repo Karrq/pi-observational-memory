@@ -41,6 +41,7 @@ describe("V3 config", () => {
 			compactAfterTokens: 81000,
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
+			reflectionsPoolTargetTokens: 8000,
 			agentMaxTurns: 16,
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
@@ -359,7 +360,7 @@ describe("V3 config", () => {
 				id: "big",
 				thinking: "high",
 			});
-			for (const stage of ["observer", "dropper"] as const) {
+			for (const stage of ["observer", "reflection-dropper", "dropper"] as const) {
 				expect(resolveConfiguredModel(config, active, stage)).toEqual({
 					provider: "synthetic",
 					id: "small",
@@ -386,5 +387,45 @@ describe("V3 config", () => {
 				{ match: "*", stages: ["observer"], provider: "synthetic", id: "small" },
 			]);
 		});
+		it("routes the reflection dropper as its own stage", () => {
+			writeJson(join(agentDir, "settings.json"), {
+				"observational-memory": {
+					modelMap: [
+						{ match: "*", stages: ["reflection-dropper"], provider: "anthropic", id: "big" },
+						{ match: "*", provider: "synthetic", id: "small" },
+					],
+				},
+			});
+			const config = loadConfig(cwd, {});
+			const active = { provider: "claude-bridge", id: "opus-5" };
+
+			expect(resolveConfiguredModel(config, active, "reflection-dropper")).toEqual({
+				provider: "anthropic",
+				id: "big",
+				thinking: undefined,
+			});
+			expect(resolveConfiguredModel(config, active, "dropper")).toEqual({
+				provider: "synthetic",
+				id: "small",
+				thinking: undefined,
+			});
+		});
+	});
+
+	it("reads reflectionsPoolTargetTokens from settings and rejects invalid values", () => {
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: 3000 },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(3000);
+
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: 0 },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(8000);
+
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": { reflectionsPoolTargetTokens: "many" },
+		});
+		expect(loadConfig(cwd, {}).reflectionsPoolTargetTokens).toBe(8000);
 	});
 });

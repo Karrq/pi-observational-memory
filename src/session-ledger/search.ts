@@ -3,13 +3,14 @@ import { entryIndexForId, isSourceEntry } from "./progress.js";
 import {
 	isObservationsDroppedEntry,
 	isObservationsRecordedEntry,
+	isReflectionsDroppedEntry,
 	isReflectionsRecordedEntry,
 	type Entry,
 } from "./types.js";
 
 export type SearchDocument =
 	| { kind: "observation"; id: string; text: string; timestamp: string; relevance: string; dropped: boolean }
-	| { kind: "reflection"; id: string; text: string }
+	| { kind: "reflection"; id: string; text: string; dropped: boolean }
 	| { kind: "entry"; id: string; text: string; chunk: number };
 
 export type SearchHit = SearchDocument & { score: number };
@@ -77,8 +78,10 @@ export function hiddenSourceEntries(entries: Entry[]): Entry[] {
  */
 export function buildSearchCorpus(entries: Entry[], from = 0): SearchDocument[] {
 	const droppedObservations = new Set<string>();
+	const droppedReflections = new Set<string>();
 	for (const entry of entries) {
 		if (isObservationsDroppedEntry(entry)) entry.data.observationIds.forEach((id) => droppedObservations.add(id));
+		if (isReflectionsDroppedEntry(entry)) entry.data.reflectionIds.forEach((id) => droppedReflections.add(id));
 	}
 
 	const docs: SearchDocument[] = [];
@@ -96,7 +99,7 @@ export function buildSearchCorpus(entries: Entry[], from = 0): SearchDocument[] 
 			}
 		} else if (isReflectionsRecordedEntry(entry)) {
 			for (const reflection of entry.data.reflections) {
-				docs.push({ kind: "reflection", id: reflection.id, text: reflection.content });
+				docs.push({ kind: "reflection", id: reflection.id, text: reflection.content, dropped: droppedReflections.has(reflection.id) });
 			}
 		}
 	}

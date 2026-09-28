@@ -22,6 +22,16 @@ export function observationLineTokenCount(observation: {
 	);
 }
 
+/**
+ * Estimate the rendered footprint of a reflection line as it appears in
+ * summaries / pool listings: "[id] content". The stored `Reflection.tokenCount`
+ * counts bare content only, which undercounts the id prefix carried by every
+ * rendered line.
+ */
+export function reflectionLineTokenCount(reflection: { id: string; content: string }): number {
+	return estimateStringTokens(`[${reflection.id}] ${reflection.content}`);
+}
+
 export function estimateEntryTokens(entry: { type: string; message?: unknown; content?: unknown; summary?: unknown }): number {
 	if (entry.type === "message" && entry.message) {
 		return estimateMessageTokens(entry.message as Parameters<typeof estimateMessageTokens>[0]);

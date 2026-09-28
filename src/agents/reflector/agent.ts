@@ -24,7 +24,15 @@ interface RunReflectorArgs {
 	apiKey?: string;
 	headers?: Record<string, string>;
 	env?: Record<string, string>;
+	/** Active reflections, shown to the model as current durable memory. */
 	reflections: Reflection[];
+	/**
+	 * Reflection ids already tombstoned by the reflection dropper. Never shown to
+	 * the model, but counted as duplicates: reflection ids are content hashes, so
+	 * re-deriving dropped content would append a record the ledger fold
+	 * immediately re-suppresses, burning a run every time.
+	 */
+	droppedReflectionIds?: ReadonlySet<string>;
 	observations: Observation[];
 	signal?: AbortSignal;
 	agentLoop?: typeof agentLoop;
@@ -121,7 +129,10 @@ export async function runReflector(args: RunReflectorArgs): Promise<Reflection[]
 	});
 
 	const allowedObservationIds = observations.map((observation) => observation.id);
-	const existingReflectionIds = new Set(reflections.map((reflection) => reflection.id));
+	const existingReflectionIds = new Set([
+		...reflections.map((reflection) => reflection.id),
+		...(args.droppedReflectionIds ?? []),
+	]);
 	const accumulated = new Map<string, Reflection>();
 	let toolCallCount = 0;
 	let rawProposedReflectionCount = 0;

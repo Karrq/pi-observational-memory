@@ -32,6 +32,7 @@ export type TestReflection = {
 export const V3_OBSERVATIONS_RECORDED = "om.observations.recorded";
 export const V3_REFLECTIONS_RECORDED = "om.reflections.recorded";
 export const V3_OBSERVATIONS_DROPPED = "om.observations.dropped";
+export const V3_REFLECTIONS_DROPPED = "om.reflections.dropped";
 export const V3_FOLDED = "om.folded";
 export const V2_OBSERVATION = "om.observation";
 export const V2_DETAILS_TYPE = "observational-memory";
@@ -196,6 +197,22 @@ export function observationsDroppedEntry(
 		parentId: null,
 		timestamp: DEFAULT_TIMESTAMP,
 		customType: V3_OBSERVATIONS_DROPPED,
+		data: args,
+		...overrides,
+	};
+}
+
+export function reflectionsDroppedEntry(
+	id: string,
+	args: { reflectionIds: string[]; coversUpToId: string },
+	overrides: Partial<TestEntry> = {},
+): TestEntry {
+	return {
+		type: "custom",
+		id,
+		parentId: null,
+		timestamp: DEFAULT_TIMESTAMP,
+		customType: V3_REFLECTIONS_DROPPED,
 		data: args,
 		...overrides,
 	};

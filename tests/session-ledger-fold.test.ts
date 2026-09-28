@@ -8,6 +8,7 @@ import {
 	observationsRecordedEntry,
 	oldV2ObservationEntry,
 	reflection,
+	reflectionsDroppedEntry,
 	reflectionsRecordedEntry,
 	textCustomMessage,
 } from "./fixtures/session.js";
@@ -113,5 +114,64 @@ describe("session-ledger V3 folding", () => {
 
 		expect(foldLedger(mainBranch).observations.map((obs) => obs.id)).toEqual(["aaaa00000000"]);
 		expect(foldLedger(forkBranch).observations.map((obs) => obs.id)).toEqual(["bbbb00000000"]);
+	});
+	it("applies reflection drops as tombstones while preserving reflection history", () => {
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const ref2 = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref1, ref2], coversUpToId: "om-obs" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" }),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
+		expect(folded.activeReflections.map((ref) => ref.id)).toEqual(["ffffffffffff"]);
+		expect(folded.droppedReflectionIds.has("eeeeeeeeeeee")).toBe(true);
+		expect(folded.reflectionsById.get("eeeeeeeeeeee")).toEqual(ref1);
+	});
+
+	it("keeps reflection tombstones for ids that are not folded yet", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["999999999999"], coversUpToId: "raw-1" }),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.droppedReflectionIds.has("999999999999")).toBe(true);
+		expect(folded.reflections).toEqual([]);
+		expect(folded.activeReflections).toEqual([]);
+	});
+
+	it("ignores reflection drops after the fold boundary", () => {
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref1], coversUpToId: "raw-1" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" }),
+		];
+
+		const folded = foldLedger(entries, { upToEntryId: "om-ref" });
+
+		expect(folded.activeReflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+		expect(folded.droppedReflectionIds.size).toBe(0);
+	});
+
+	it("ignores invalid reflection-drop data", () => {
+		const ref1 = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref1], coversUpToId: "raw-1" }),
+			reflectionsDroppedEntry("om-bad-1", { reflectionIds: [], coversUpToId: "om-ref" }),
+			reflectionsDroppedEntry("om-bad-2", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "" }),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.droppedReflectionIds.size).toBe(0);
+		expect(folded.activeReflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
 	});
 });

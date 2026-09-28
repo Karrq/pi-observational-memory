@@ -15,6 +15,7 @@ import {
 	oldV2ObservationEntry,
 	rawMessage,
 	reflection,
+	reflectionsDroppedEntry,
 	reflectionsRecordedEntry,
 	type TestEntry,
 } from "./fixtures/session.js";
@@ -142,5 +143,42 @@ describe("V3 recall tool", () => {
 
 		const both = await execute({ query: "bucket", id: "abcd1234" }, entries);
 		expect(both.result.details?.status).toBe("invalid_id");
+	});
+
+	it("renders dropped reflections as recallable but dropped", async () => {
+		const obs = observation("aaaaaaaaaaaa", { content: "User likes tea.", sourceEntryIds: ["raw-1"] });
+		const ref = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"], { content: "User likes tea." });
+		const entries = [
+			rawMessage("raw-1", "I like tea."),
+			observationsRecordedEntry("om-obs", { observations: [obs], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref], coversUpToId: "om-obs" }),
+			reflectionsDroppedEntry("om-ref-drop", { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "om-ref" }),
+		];
+
+		const { result, text } = await execute("eeeeeeeeeeee", entries);
+		const tui = formatRecallRenderedResultForTui(result as any, false);
+
+		expect(result.details?.status).toBe("ok");
+		expect(result.details?.reflections[0].status).toBe("dropped");
+		expect(text).toContain("Reflection eeeeeeeeeeee is dropped from active memory but remains recallable.");
+		expect(text).toContain("[eeeeeeeeeeee] [dropped] User likes tea.");
+		expect(tui).toContain("one or more reflections are dropped from active memory but remain recallable");
+		// Supporting evidence survives the tombstone.
+		expect(text).toContain("I like tea.");
+	});
+
+	it("leaves an active reflection unmarked", async () => {
+		const obs = observation("aaaaaaaaaaaa", { content: "User likes tea.", sourceEntryIds: ["raw-1"] });
+		const ref = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"], { content: "User likes tea." });
+		const entries = [
+			rawMessage("raw-1", "I like tea."),
+			observationsRecordedEntry("om-obs", { observations: [obs], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref], coversUpToId: "om-obs" }),
+		];
+
+		const { result, text } = await execute("eeeeeeeeeeee", entries);
+
+		expect(result.details?.reflections[0].status).toBe("active");
+		expect(text).not.toContain("[dropped]");
 	});
 });
