@@ -5,6 +5,10 @@ const mockAgents = vi.hoisted(() => ({
 	runReflector: vi.fn(),
 	runReflectionDropper: vi.fn(),
 	runDropper: vi.fn(),
+	runSystemOneDropper: vi.fn(),
+	scoreObservations: vi.fn(),
+	appendDropScores: vi.fn(),
+	appendReflectionDropScores: vi.fn(),
 }));
 
 vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
@@ -12,8 +16,26 @@ vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 	runObserver: mockAgents.runObserver,
 }));
 vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.runReflector }));
-vi.mock("../src/agents/reflection-dropper/agent.js", () => ({ runReflectionDropper: mockAgents.runReflectionDropper }));
-vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
+// The evidence and sort helpers stay real; the score log ranks the pool with them.
+vi.mock("../src/agents/reflection-dropper/agent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/agents/reflection-dropper/agent.js")>()),
+	runReflectionDropper: mockAgents.runReflectionDropper,
+}));
+// Only the agent entry point is stubbed; selectDropCandidates is a pure ranking
+// helper the score log uses for its heuristic baseline.
+vi.mock("../src/agents/dropper/agent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/agents/dropper/agent.js")>()),
+	runDropper: mockAgents.runDropper,
+}));
+vi.mock("../src/agents/dropper/system-one/agent.js", () => ({
+	runSystemOneDropper: mockAgents.runSystemOneDropper,
+	scoreObservations: mockAgents.scoreObservations,
+}));
+vi.mock("../src/drop-scores.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/drop-scores.js")>()),
+	appendDropScores: mockAgents.appendDropScores,
+	appendReflectionDropScores: mockAgents.appendReflectionDropScores,
+}));
 
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
@@ -39,10 +61,18 @@ beforeEach(() => {
 	mockAgents.runReflector.mockReset();
 	mockAgents.runReflectionDropper.mockReset();
 	mockAgents.runDropper.mockReset();
+	mockAgents.runSystemOneDropper.mockReset();
+	mockAgents.scoreObservations.mockReset();
+	mockAgents.appendDropScores.mockReset();
+	mockAgents.scoreObservations.mockResolvedValue({ signalsById: new Map(), requestCount: 0, inputTokens: 0 });
+	mockAgents.appendDropScores.mockReturnValue(true);
+	mockAgents.appendReflectionDropScores.mockReset();
+	mockAgents.appendReflectionDropScores.mockReturnValue(true);
 	mockAgents.runObserver.mockResolvedValue(undefined);
 	mockAgents.runReflector.mockResolvedValue(undefined);
 	mockAgents.runReflectionDropper.mockResolvedValue(undefined);
 	mockAgents.runDropper.mockResolvedValue(undefined);
+	mockAgents.runSystemOneDropper.mockResolvedValue(undefined);
 });
 
 function setup(args: {
@@ -58,6 +88,7 @@ function setup(args: {
 	consolidationInFlight?: boolean;
 	appendEntryReturnsId?: boolean;
 	sessionId?: string;
+	systemOneDropper?: Record<string, unknown>;
 }) {
 	let entries = [...args.entries];
 	let sessionId = args.sessionId ?? "session-1";
@@ -87,6 +118,7 @@ function setup(args: {
 			agentMaxTurns: 9,
 			agentMaxTokens: 32000,
 			model: { provider: "anthropic", id: "memory", thinking: "minimal" },
+			systemOneDropper: args.systemOneDropper,
 		},
 		consolidationInFlight: args.consolidationInFlight ?? false,
 		consolidationPhase: undefined as "observer" | "reflector" | "reflection-dropper" | "dropper" | undefined,
@@ -585,6 +617,178 @@ describe("V3 consolidation trigger", () => {
 		expect(mockAgents.runDropper).toHaveBeenCalledWith(expect.objectContaining({ reflections: [newRef], observations: [obsA] }));
 		expect(pi.appendEntry.mock.calls[0]).toEqual([OM_REFLECTIONS_RECORDED, { reflections: [newRef], coversUpToId: "raw-1" }]);
 		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }]);
+	});
+
+	it("routes the dropper to the System One endpoint in primary mode", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runSystemOneDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi, runtime } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "primary", endpoint: "http://localhost:8080", apiKeyEnv: "TEST_KEY", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(mockAgents.runSystemOneDropper).toHaveBeenCalledWith(expect.objectContaining({
+			reflections: [newRef],
+			observations: [obsA],
+		}));
+		// The endpoint replaces the pi model entirely for this stage.
+		expect(runtime.resolveModel).not.toHaveBeenCalledWith(expect.anything(), "dropper");
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }]);
+	});
+
+	it("keeps the LLM dropper when the System One block is present but off", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "off", endpoint: "http://localhost:8080" },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runSystemOneDropper).not.toHaveBeenCalled();
+		expect(mockAgents.runDropper).toHaveBeenCalledOnce();
+	});
+
+	it("scores in shadow mode but lets the LLM dropper decide, pairing both in the score log", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		mockAgents.scoreObservations.mockResolvedValueOnce({
+			// The endpoint would have kept it; the LLM dropped it. That disagreement
+			// is exactly what the log has to preserve.
+			signalsById: new Map([["aaaaaaaaaaaa", { floor: 0.01, redundant: 0.1, superseded: 0.1, lowSignal: 0.1, safety: 0.2 }]]),
+			requestCount: 1,
+			inputTokens: 10,
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", apiKeyEnv: "TEST_KEY", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.scoreObservations).toHaveBeenCalledOnce();
+		expect(mockAgents.runSystemOneDropper).not.toHaveBeenCalled();
+		// The applied drop is the LLM's, unchanged by shadow scoring.
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }]);
+
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			observationId: "aaaaaaaaaaaa",
+			systemOneDecision: "keep",
+			llmDecision: "drop",
+		});
+		expect(rows[0].dropProbability).toBeCloseTo(0.02);
+	});
+
+	it("separates what the LLM proposed from what survived the budget sort", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		// The model asks for both; only the first fits the budget, so the second is
+		// a proposal the sort rejected rather than an observation it wanted kept.
+		mockAgents.runDropper.mockImplementationOnce(async (args: any) => {
+			args.onProposedIds?.(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+			return ["aaaaaaaaaaaa"];
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA, obsB], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		const byId = Object.fromEntries(rows.map((row: any) => [row.observationId, row]));
+		expect(byId["aaaaaaaaaaaa"]).toMatchObject({ llmProposed: true, llmDecision: "drop" });
+		expect(byId["bbbbbbbbbbbb"]).toMatchObject({ llmProposed: true, llmDecision: "keep" });
+	});
+
+	it("omits llmProposed when the dropper never reported a proposal", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		expect(rows[0].llmProposed).toBeUndefined();
+	});
+
+	it("records an unscored row when shadow scoring fails, without blocking the drop", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		mockAgents.scoreObservations.mockRejectedValueOnce(new Error("endpoint down"));
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }]);
+		const [, rows] = mockAgents.appendDropScores.mock.calls[0];
+		expect(rows[0]).toMatchObject({ systemOneDecision: "unscored", llmDecision: "drop" });
+		expect(rows[0].signals).toBeUndefined();
 	});
 
 	it("does not launch dropper-only work when active pool is over target", () => {
@@ -1111,6 +1315,56 @@ describe("V3 reflection dropper stage", () => {
 			targetTokens: 5,
 		}));
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_REFLECTIONS_DROPPED, { reflectionIds: ["eeeeeeeeeeee"], coversUpToId: "raw-1" });
+	});
+
+	it("records what the reflection dropper proposed next to what the budget let through", async () => {
+		const refB = reflection("ffffffffffff", ["bbbbbbbbbbbb"]);
+		mockAgents.runReflectionDropper.mockImplementationOnce(async (args: any) => {
+			args.onProposedIds(["eeeeeeeeeeee", "ffffffffffff"]);
+			return ["eeeeeeeeeeee"];
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA, obsB], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [refA, refB], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			reflectionsPoolTargetTokens: 5,
+			systemOneDropper: { mode: "shadow", endpoint: "http://localhost:8080", vetoThreshold: 0.15, dropThreshold: 0.75 },
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.appendReflectionDropScores).toHaveBeenCalledTimes(1);
+		const [sessionId, rows] = mockAgents.appendReflectionDropScores.mock.calls[0];
+		expect(sessionId).toBe("session-1");
+		expect(rows.map((row: any) => [row.reflectionId, row.proposed, row.decision])).toEqual([
+			["eeeeeeeeeeee", true, "drop"],
+			["ffffffffffff", true, "keep"],
+		]);
+		expect(rows.map((row: any) => row.sortRank).sort()).toEqual([0, 1]);
+		expect(JSON.stringify(rows)).not.toContain(refA.content);
+	});
+
+	it("does not record reflection drop scores when the System One dropper is off", async () => {
+		mockAgents.runReflectionDropper.mockResolvedValueOnce(["eeeeeeeeeeee"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [refA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({ entries, observeAfterTokens: 999, reflectionsPoolTargetTokens: 5 });
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runReflectionDropper).toHaveBeenCalled();
+		expect(mockAgents.appendReflectionDropScores).not.toHaveBeenCalled();
 	});
 
 	it("does not run the reflection dropper when the reflector clock is not due", async () => {

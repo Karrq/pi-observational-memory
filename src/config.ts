@@ -96,6 +96,62 @@ export const RECALL_EMBEDDINGS_DEFAULTS: Readonly<RecallEmbeddingsConfig> = {
 	queryPrefix: "Represent this sentence for searching relevant passages: ",
 };
 
+/**
+ * Routes the dropper stage to a System One decision endpoint (TypeSafe's Jev,
+ * or any server implementing `POST /v1/systemone`) instead of the tool-calling
+ * LLM dropper.
+ *
+ * The endpoint scores each active observation with typed questions and returns
+ * calibrated probabilities; `vetoThreshold` and `dropThreshold` turn those into
+ * a ranked candidate list, which still passes through the same budget and
+ * tie-break selection the LLM dropper uses.
+ */
+/**
+ * - `off`: the block is inert; the LLM dropper decides.
+ * - `shadow`: the endpoint scores every observation but the LLM dropper still
+ *   decides. Both are written to the drop-score log, which pairs each score
+ *   with the LLM's verdict so a calibration map can be fitted from them.
+ * - `primary`: the endpoint decides.
+ */
+export const SYSTEM_ONE_MODES = ["off", "shadow", "primary"] as const;
+export type SystemOneMode = (typeof SYSTEM_ONE_MODES)[number];
+
+export interface SystemOneDropperConfig {
+	mode: SystemOneMode;
+	/** Base URL; `/v1/systemone` is appended. */
+	endpoint: string;
+	model: string;
+	/** Environment variable holding the bearer token. Local endpoints may not need one. */
+	apiKeyEnv: string;
+	/**
+	 * Keep the observation when P(uniquely carries a preservation-floor item)
+	 * reaches this. Deliberately low: losing a user constraint costs far more
+	 * than keeping one redundant line.
+	 */
+	vetoThreshold: number;
+	/** Minimum P(safe to drop) before an observation becomes a candidate. */
+	dropThreshold: number;
+	/**
+	 * Questions per request. The API budget is 64k for state plus all questions,
+	 * so large pools fan out across several requests against the same state.
+	 */
+	maxQuestionsPerRequest: number;
+	requestTimeoutMs: number;
+}
+
+export const SYSTEM_ONE_DROPPER_DEFAULTS: Readonly<SystemOneDropperConfig> = {
+	// Scoring without deciding is the safe default for a newly configured
+	// endpoint: it produces calibration data without changing any drop.
+	mode: "shadow",
+	endpoint: "https://api.typesafe.ai",
+	model: "jev-latest",
+	apiKeyEnv: "TYPESAFE_API_KEY",
+	vetoThreshold: 0.15,
+	dropThreshold: 0.75,
+	maxQuestionsPerRequest: 250,
+	requestTimeoutMs: 60_000,
+};
+
 export interface Config {
 	observeAfterTokens: number | TokenThreshold;
 	reflectAfterTokens: number | TokenThreshold;
@@ -139,6 +195,8 @@ export interface Config {
 	modelMap: ModelMapEntry[];
 	selfCompact: SelfCompactConfig;
 	recallEmbeddings: RecallEmbeddingsConfig;
+	/** Unset leaves the dropper on the tool-calling LLM path. */
+	systemOneDropper?: SystemOneDropperConfig;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -440,6 +498,36 @@ export function normalizeRecallEmbeddings(value: unknown): RecallEmbeddingsConfi
 	};
 }
 
+/** A probability threshold must be a finite number within [0, 1]. */
+function probabilityOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
+}
+
+/**
+ * Absent or non-object config leaves the dropper on the LLM path. Individual
+ * malformed fields fall back to their default rather than rejecting the block,
+ * so a bad threshold does not silently disable a configured endpoint.
+ */
+export function normalizeSystemOneDropper(value: unknown): SystemOneDropperConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	const endpoint = nonEmptyString(value.endpoint) ?? SYSTEM_ONE_DROPPER_DEFAULTS.endpoint;
+	const mode = (SYSTEM_ONE_MODES as readonly unknown[]).includes(value.mode)
+		? value.mode as SystemOneMode
+		: SYSTEM_ONE_DROPPER_DEFAULTS.mode;
+	return {
+		mode,
+		endpoint: endpoint.replace(/\/+$/, ""),
+		model: nonEmptyString(value.model) ?? SYSTEM_ONE_DROPPER_DEFAULTS.model,
+		apiKeyEnv: nonEmptyString(value.apiKeyEnv) ?? SYSTEM_ONE_DROPPER_DEFAULTS.apiKeyEnv,
+		vetoThreshold: probabilityOrUndefined(value.vetoThreshold) ?? SYSTEM_ONE_DROPPER_DEFAULTS.vetoThreshold,
+		dropThreshold: probabilityOrUndefined(value.dropThreshold) ?? SYSTEM_ONE_DROPPER_DEFAULTS.dropThreshold,
+		maxQuestionsPerRequest: positiveIntegerOrUndefined(value.maxQuestionsPerRequest)
+			?? SYSTEM_ONE_DROPPER_DEFAULTS.maxQuestionsPerRequest,
+		requestTimeoutMs: positiveIntegerOrUndefined(value.requestTimeoutMs)
+			?? SYSTEM_ONE_DROPPER_DEFAULTS.requestTimeoutMs,
+	};
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -461,6 +549,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	if (selfCompact) normalized.selfCompact = selfCompact;
 	const recallEmbeddings = normalizeRecallEmbeddings(value.recallEmbeddings);
 	if (recallEmbeddings) normalized.recallEmbeddings = recallEmbeddings;
+	const systemOneDropper = normalizeSystemOneDropper(value.systemOneDropper);
+	if (systemOneDropper) normalized.systemOneDropper = systemOneDropper;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;

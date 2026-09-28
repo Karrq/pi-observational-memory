@@ -1,8 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
+import { runSystemOneDropper, scoreObservations } from "../agents/dropper/system-one/agent.js";
+import { dropProbability, type ObservationSignals } from "../agents/dropper/system-one/questions.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
+import { appendDropScores, appendReflectionDropScores, type DropScoreRow, type ReflectionDropRow } from "../drop-scores.js";
+import { coverageTierForObservation, reflectionCoverageMap } from "../agents/dropper/coverage.js";
+import { selectDropCandidates } from "../agents/dropper/agent.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
-import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
+import { reflectionEvidenceMap, runReflectionDropper, selectReflectionDropCandidates } from "../agents/reflection-dropper/agent.js";
 import { reflectionPoolMetrics } from "../agents/reflection-dropper/pool.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
@@ -327,6 +332,127 @@ function debugSessionMetadata(ctx: ConsolidationCtx): { sessionId?: string; sess
 	} catch {
 		return {};
 	}
+}
+
+/**
+ * Write one row per scored observation, pairing the endpoint's signals with the
+ * decision that was actually applied.
+ *
+ * In shadow mode the applied decision is the LLM dropper's, which is the label a
+ * calibration map is fitted against. Rows are also written for observations the
+ * endpoint could not score, so the log records the whole pool rather than only
+ * the candidates, and a map fitted from it sees both tails.
+ */
+function recordDropScores(args: {
+	ctx: ConsolidationCtx;
+	config: NonNullable<Runtime["config"]["systemOneDropper"]>;
+	observations: Observation[];
+	reflections: Reflection[];
+	signalsById: Map<string, ObservationSignals> | undefined;
+	droppedIds: string[] | undefined;
+	proposedIds: readonly string[] | undefined;
+	llmDecided: boolean;
+}): void {
+	const { ctx, config, observations, reflections, signalsById, droppedIds, proposedIds, llmDecided } = args;
+	if (observations.length === 0) return;
+
+	const coverageById = reflectionCoverageMap(observations, reflections);
+	const dropped = new Set(droppedIds ?? []);
+	const proposed = proposedIds ? new Set(proposedIds) : undefined;
+	// Rank the whole pool by the existing heuristic so the model can be compared
+	// against it later on the same labels.
+	const heuristicOrder = selectDropCandidates(
+		observations.map((observation) => observation.id),
+		observations,
+		observations.length,
+		reflections,
+	);
+	const heuristicRank = new Map(heuristicOrder.map((id, index) => [id, index]));
+	const ts = new Date().toISOString();
+	const { sessionId } = debugSessionMetadata(ctx);
+
+	const rows: DropScoreRow[] = observations.map((observation) => {
+		const signals = signalsById?.get(observation.id);
+		const probability = signals ? dropProbability(signals) : undefined;
+		const systemOneDecision = !signals
+			? "unscored" as const
+			: signals.floor >= config.vetoThreshold
+				? "vetoed" as const
+				: (probability ?? 0) >= config.dropThreshold
+					? "drop" as const
+					: "keep" as const;
+		return {
+			ts,
+			sessionId,
+			observationId: observation.id,
+			relevance: observation.relevance,
+			coverage: coverageTierForObservation(observation, coverageById),
+			...(signals ? { signals, dropProbability: probability } : {}),
+			systemOneDecision,
+			...(llmDecided ? { llmDecision: dropped.has(observation.id) ? "drop" as const : "keep" as const } : {}),
+			...(proposed ? { llmProposed: proposed.has(observation.id) } : {}),
+			heuristicRank: heuristicRank.get(observation.id) ?? observations.length,
+		};
+	});
+
+	const written = appendDropScores(sessionId, rows);
+	debugLog("dropper.scores_recorded", {
+		written,
+		rowCount: rows.length,
+		scoredCount: rows.filter((row) => row.signals !== undefined).length,
+		llmDecided,
+	});
+}
+
+/**
+ * Write one row per active reflection, pairing what the reflection dropper
+ * proposed with what the budget let through. Rows cover the whole pool, kept
+ * reflections included, so a run with no drops is still recorded.
+ */
+function recordReflectionDropScores(args: {
+	ctx: ConsolidationCtx;
+	folded: ReturnType<typeof foldLedger>;
+	droppedIds: string[] | undefined;
+	proposedIds: readonly string[] | undefined;
+}): void {
+	const { ctx, folded, droppedIds, proposedIds } = args;
+	const reflections = folded.activeReflections;
+	if (reflections.length === 0) return;
+
+	const evidenceById = reflectionEvidenceMap(reflections, {
+		observationsById: folded.observationsById,
+		droppedObservationIds: folded.droppedObservationIds,
+	});
+	const sortOrder = selectReflectionDropCandidates(
+		reflections.map((reflection) => reflection.id),
+		reflections,
+		reflections.length,
+		evidenceById,
+	);
+	const sortRank = new Map(sortOrder.map((id, index) => [id, index]));
+	const dropped = new Set(droppedIds ?? []);
+	const proposed = new Set(proposedIds ?? []);
+	const ts = new Date().toISOString();
+	const { sessionId } = debugSessionMetadata(ctx);
+
+	const rows: ReflectionDropRow[] = reflections.map((reflection) => {
+		const evidence = evidenceById.get(reflection.id);
+		return {
+			ts,
+			sessionId,
+			reflectionId: reflection.id,
+			proposed: proposed.has(reflection.id),
+			decision: dropped.has(reflection.id) ? "drop" as const : "keep" as const,
+			sortRank: sortRank.get(reflection.id) ?? reflections.length,
+			orphanCount: evidence?.orphanCount ?? 0,
+			activeSupportCount: evidence?.activeSupportCount ?? 0,
+			droppedSupportCount: evidence?.droppedSupportCount ?? 0,
+			...(evidence?.lastEvidenceTimestamp ? { lastEvidenceTimestamp: evidence.lastEvidenceTimestamp } : {}),
+		};
+	});
+
+	const written = appendReflectionDropScores(sessionId, rows);
+	debugLog("reflection_dropper.scores_recorded", { written, rowCount: rows.length });
 }
 
 function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
@@ -668,6 +794,7 @@ async function runReflectionDropperStage(
 	const resolved = await resolver.resolve("reflection-dropper");
 	if (!resolved) return { sameRunDroppedReflectionIds: [] };
 
+	let proposedIds: readonly string[] | undefined;
 	const droppedIds = await runStageWithFallback(ctx, "reflection-dropper", resolved, resolver, (worker) => runReflectionDropper({
 		model: worker.model as any,
 		apiKey: worker.apiKey,
@@ -682,7 +809,13 @@ async function runReflectionDropperStage(
 		maxOutputTokens: runtime.config.agentMaxTokens,
 		thinkingLevel: workerThinkingLevel(runtime, worker),
 		modelRegistry: ctx.modelRegistry,
+		onProposedIds: (ids) => { proposedIds = ids; },
 	}));
+	// Recorded under the same switch as the observation score log, so drop
+	// evaluation data is either collected for both droppers or for neither.
+	if ((runtime.config.systemOneDropper?.mode ?? "off") !== "off") {
+		recordReflectionDropScores({ ctx, folded, droppedIds, proposedIds });
+	}
 	const data = droppedIds ? buildReflectionsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("reflection_dropper.append", {
 		droppedIdsCount: droppedIds?.length ?? 0,
@@ -755,8 +888,6 @@ async function runDropperStage(
 		`Observational memory: dropper running after reflection — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
 		"info",
 	);
-	const resolved = await resolver.resolve("dropper");
-	if (!resolved) return "abort";
 
 	// Coverage evidence must come from reflections that are still active. An
 	// observation dropped against a reflection tombstoned earlier in this same
@@ -766,19 +897,62 @@ async function runDropperStage(
 		folded.activeReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 		sameRunReflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 	);
-	const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
-		model: worker.model as any,
-		apiKey: worker.apiKey,
-		headers: worker.headers,
-		env: worker.env,
+	const systemOne = runtime.config.systemOneDropper;
+	const mode = systemOne?.mode ?? "off";
+	const systemOneArgs = systemOne && {
+		config: systemOne,
+		apiKey: process.env[systemOne.apiKeyEnv],
 		reflections: reflectionsForDropper,
 		observations: folded.activeObservations,
 		targetTokens: runtime.config.observationsPoolTargetTokens,
-		maxTurns: runtime.config.agentMaxTurns,
-		maxOutputTokens: runtime.config.agentMaxTokens,
-		thinkingLevel: workerThinkingLevel(runtime, worker),
-		modelRegistry: ctx.modelRegistry,
-	}));
+	};
+
+	let droppedIds: string[] | undefined;
+	let proposedIds: readonly string[] | undefined;
+	let signalsById: Map<string, ObservationSignals> | undefined;
+
+	if (systemOne && mode === "primary") {
+		droppedIds = await runSystemOneDropper(systemOneArgs!);
+	} else {
+		// Shadow scoring runs first so a broken endpoint fails before the LLM
+		// dropper spends tokens, and never silently changes which ids are dropped.
+		if (systemOne && mode === "shadow") {
+			try {
+				signalsById = (await scoreObservations(systemOneArgs!)).signalsById;
+			} catch (error) {
+				debugLog("dropper.system_one.shadow_failed", { errorMessage: String(error) });
+			}
+		}
+		const resolved = await resolver.resolve("dropper");
+		if (!resolved) return "abort";
+		droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
+			model: worker.model as any,
+			apiKey: worker.apiKey,
+			headers: worker.headers,
+			env: worker.env,
+			reflections: reflectionsForDropper,
+			observations: folded.activeObservations,
+			targetTokens: runtime.config.observationsPoolTargetTokens,
+			maxTurns: runtime.config.agentMaxTurns,
+			maxOutputTokens: runtime.config.agentMaxTokens,
+			thinkingLevel: workerThinkingLevel(runtime, worker),
+			modelRegistry: ctx.modelRegistry,
+			onProposedIds: (ids) => { proposedIds = ids; },
+		}));
+	}
+
+	if (systemOne && mode !== "off") {
+		recordDropScores({
+			ctx,
+			config: systemOne,
+			observations: folded.activeObservations,
+			reflections: reflectionsForDropper,
+			signalsById,
+			droppedIds,
+			proposedIds,
+			llmDecided: mode === "shadow",
+		});
+	}
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, reflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("dropper.append", {

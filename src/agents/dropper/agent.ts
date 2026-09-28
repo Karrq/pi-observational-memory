@@ -53,6 +53,15 @@ interface RunDropperArgs {
 	thinkingLevel?: ModelThinkingLevel;
 	modelRegistry?: StreamableModelRegistry;
 	streamSimple?: WorkerStreamSimple;
+	/**
+	 * Receives what the model actually asked to drop, before the budget and the
+	 * coverage/relevance/age sort in `selectDropCandidates` cut it down.
+	 *
+	 * The returned ids alone cannot tell the two apart: when candidates tie on
+	 * coverage and relevance, age decides which survive the cut, so a selection
+	 * that looks age-driven may be the sort rather than the model's judgement.
+	 */
+	onProposedIds?: (ids: readonly string[]) => void;
 }
 
 const RELEVANCE_DROP_RANK: Record<Observation["relevance"], number> = {
@@ -279,6 +288,7 @@ export async function runDropper(args: RunDropperArgs): Promise<string[] | undef
 		logAgentStreamError("dropper", event);
 	}
 	await stream.result();
+	args.onProposedIds?.(proposedDropIds);
 	const droppedIds = selectDropCandidates(proposedDropIds, observations, maxDropsAllowed, reflections);
 	const reason = droppedIds.length > 0
 		? "selected_nonempty"
@@ -297,6 +307,7 @@ export async function runDropper(args: RunDropperArgs): Promise<string[] | undef
 		duplicateInRequestCount,
 		duplicateInRunCount,
 		acceptedCandidateCount: proposedDropIds.length,
+		proposedDropIds,
 		selectedDropsCount: droppedIds.length,
 		selectedDropTokens,
 		selectedCoverageSummaryByRelevance: summarizeCoverageByRelevanceForIds(droppedIds, observations, coverageById),

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerIndexCommand } from "./commands/index-embeddings.js";
 import { registerConsolidateCommand } from "./commands/consolidate.js";
+import { registerExportDropsCommand } from "./commands/export-drops.js";
 import { registerStatusCommand } from "./commands/status.js";
 import { registerViewCommand } from "./commands/view.js";
 import { registerCompactionHook } from "./hooks/compaction-hook.js";
@@ -41,4 +42,5 @@ export default function observationalMemory(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`Observational memory: recall embeddings unavailable, using keyword search: ${embeddings.failure}`, "warning");
 		});
 	});
+	registerExportDropsCommand(pi, runtime);
 }
