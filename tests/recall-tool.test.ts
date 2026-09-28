@@ -11,6 +11,7 @@ import {
 	observation,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
+	compactionEntry,
 	oldV2ObservationEntry,
 	rawMessage,
 	reflection,
@@ -23,12 +24,13 @@ function fakeCtx(entries: TestEntry[]) {
 	const getEntries = vi.fn(() => {
 		throw new Error("recall tool must not use getEntries");
 	});
-	return { ctx: { sessionManager: { getBranch, getEntries } }, getBranch, getEntries };
+	return { ctx: { sessionManager: { getBranch, getEntries, getSessionId: () => "session-1" } }, getBranch, getEntries };
 }
 
-async function execute(id: string, entries: TestEntry[]) {
+async function execute(id: string | { id?: string; query?: string }, entries: TestEntry[]) {
 	const { ctx, getBranch, getEntries } = fakeCtx(entries);
-	const result = await recallObservationTool.execute("tool-1", { id }, undefined as any, undefined as any, ctx as any);
+	const params = typeof id === "string" ? { id } : id;
+	const result = await recallObservationTool.execute("tool-1", params, undefined as any, undefined as any, ctx as any);
 	const text = result.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n");
 	return { result, text, getBranch, getEntries };
 }
@@ -111,7 +113,7 @@ describe("V3 recall tool", () => {
 		const { result, text, getBranch } = await execute("not-valid", []);
 
 		expect(result.details?.status).toBe("invalid_id");
-		expect(text).toContain("Memory id must be 12 lowercase hex characters");
+		expect(text).toContain("12 lowercase hex characters for memory");
 		expect(getBranch).not.toHaveBeenCalled();
 	});
 
@@ -122,5 +124,23 @@ describe("V3 recall tool", () => {
 
 		expect(result.details?.status).toBe("not_found");
 		expect(text).toContain("No observation or reflection with id aaaaaaaaaaaa was found");
+	});
+	it("searches by query and expands transcript hits by entry id", async () => {
+		const entries = [
+			rawMessage("abcd1234", "The deploy failed because the S3 bucket policy denied PutObject."),
+			rawMessage("abcd5678", "Recent turn."),
+			compactionEntry("cmp-1", { firstKeptEntryId: "abcd5678" }),
+		];
+
+		const search = await execute({ query: "bucket policy" }, entries);
+		expect(search.text).toContain("[abcd1234] transcript");
+		expect(search.text).toContain("Pass an id to recall");
+
+		const expanded = await execute("abcd1234", entries);
+		expect(expanded.result.details?.status).toBe("ok");
+		expect(expanded.text).toContain("denied PutObject");
+
+		const both = await execute({ query: "bucket", id: "abcd1234" }, entries);
+		expect(both.result.details?.status).toBe("invalid_id");
 	});
 });

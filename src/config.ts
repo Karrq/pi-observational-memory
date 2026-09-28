@@ -77,6 +77,25 @@ export interface SelfCompactConfig {
 	warnAt: (number | TokenThreshold)[];
 }
 
+/**
+ * Local semantic ranking for `recall` queries. The model runs in-process
+ * through transformers.js; weights download once into Pi's agent directory.
+ * `pooling` and `queryPrefix` must match the model's training recipe.
+ */
+export interface RecallEmbeddingsConfig {
+	enabled: boolean;
+	model: string;
+	pooling: "cls" | "mean";
+	queryPrefix: string;
+}
+
+export const RECALL_EMBEDDINGS_DEFAULTS: Readonly<RecallEmbeddingsConfig> = {
+	enabled: false,
+	model: "Xenova/bge-small-en-v1.5",
+	pooling: "cls",
+	queryPrefix: "Represent this sentence for searching relevant passages: ",
+};
+
 export interface Config {
 	observeAfterTokens: number | TokenThreshold;
 	reflectAfterTokens: number | TokenThreshold;
@@ -117,6 +136,7 @@ export interface Config {
 	showWorkerNotifications: boolean;
 	modelMap: ModelMapEntry[];
 	selfCompact: SelfCompactConfig;
+	recallEmbeddings: RecallEmbeddingsConfig;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -142,6 +162,7 @@ export const DEFAULTS: Config = {
 	showWorkerNotifications: true,
 	modelMap: [],
 	selfCompact: { enabled: false, warnAt: [] },
+	recallEmbeddings: { ...RECALL_EMBEDDINGS_DEFAULTS },
 	passive: false,
 	debugLog: false,
 };
@@ -405,6 +426,17 @@ export function normalizeSelfCompact(value: unknown): SelfCompactConfig | undefi
 	return { enabled: value.enabled === true, warnAt };
 }
 
+/** Malformed fields fall back to defaults; a non-object block is ignored. */
+export function normalizeRecallEmbeddings(value: unknown): RecallEmbeddingsConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	return {
+		enabled: value.enabled === true,
+		model: nonEmptyString(value.model) ?? RECALL_EMBEDDINGS_DEFAULTS.model,
+		pooling: value.pooling === "cls" || value.pooling === "mean" ? value.pooling : RECALL_EMBEDDINGS_DEFAULTS.pooling,
+		queryPrefix: typeof value.queryPrefix === "string" ? value.queryPrefix : RECALL_EMBEDDINGS_DEFAULTS.queryPrefix,
+	};
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -423,6 +455,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	if (modelMap) normalized.modelMap = modelMap;
 	const selfCompact = normalizeSelfCompact(value.selfCompact);
 	if (selfCompact) normalized.selfCompact = selfCompact;
+	const recallEmbeddings = normalizeRecallEmbeddings(value.recallEmbeddings);
+	if (recallEmbeddings) normalized.recallEmbeddings = recallEmbeddings;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;

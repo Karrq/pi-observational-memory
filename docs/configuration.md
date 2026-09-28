@@ -77,6 +77,10 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `fallbackModel.thinking` | enum | unset; falls back to `model.thinking` then `low` | Optional reasoning/thinking level used when the fallback is active. |
 | `selfCompact.enabled` | boolean | `false` | Gives the agent the `compact_context` tool so it can compact at a breakpoint it chooses. |
 | `selfCompact.warnAt` | array of thresholds | `[]` | Context-usage levels at which the agent is asked to call `compact_context`. Same number or `{ type, value }` forms as other thresholds. |
+| `recallEmbeddings.enabled` | boolean | `false` | Adds local semantic ranking to `recall` queries. |
+| `recallEmbeddings.model` | string | `Xenova/bge-small-en-v1.5` | transformers.js feature-extraction model id. |
+| `recallEmbeddings.pooling` | `cls` \| `mean` | `cls` | Pooling the model was trained with. |
+| `recallEmbeddings.queryPrefix` | string | BGE retrieval prefix | Text prepended to queries, as the model's recipe requires. |
 | `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
@@ -236,6 +240,16 @@ Input that arrives before the compaction starts cancels it. Proactive `compactAf
   }
 }
 ```
+
+## `recallEmbeddings`
+
+Default: `{ "enabled": false }`.
+
+When enabled, `recall` queries fuse keyword ranking with semantic similarity (reciprocal rank fusion over the top 50 semantic candidates). This finds matches that share no words with the query. The model runs in-process through the optional `@huggingface/transformers` dependency. No embedding API is called. The weights download once into `observational-memory/models` under Pi's agent directory. The default model is about 33 MB.
+
+Indexing runs in the background at session start and after each agent run. It embeds memory and hidden transcript chunks that have no vector yet, and stores the vectors per session under `observational-memory/embeddings`. Queries never wait for indexing. Documents not embedded yet compete on keyword rank alone. A long session with a few thousand chunks takes about a minute of CPU the first time. If the runtime or model cannot load, recall falls back to keyword search and shows one warning.
+
+Changing `model` rebuilds the index, because stored vectors are tied to the model. Set `pooling` and `queryPrefix` to match the new model. For `Xenova/all-MiniLM-L6-v2`, use `"pooling": "mean"` and `"queryPrefix": ""`.
 
 ## `showWorkerNotifications`
 

@@ -16,7 +16,7 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 | `session_before_compact` hook | Build the V3 compaction payload deterministically. |
 | `/om:status` | Show ledger counts, drift, progress clocks, and worker state. |
 | `/om:view` | Show visible or full memory content and attempt to copy the rendered memory text. |
-| `recall` tool | Recover source evidence for a memory id. |
+| `recall` tool | Search earlier context by query, or recover source evidence for a memory or transcript entry id. |
 
 ## Lifecycle overview
 
@@ -272,7 +272,7 @@ These are condensed memories from earlier in this session.
 
 Treat these as past records. When entries conflict, the most recent observation reflects the latest known state. Work that prior observations describe as completed should not be redone unless the user explicitly asks to revisit it.
 
-When exact source context is needed for precision or traceability, use the recall tool with the relevant observation or reflection id. This is especially useful when a reflection materially affects a decision or is too compressed to continue confidently. Do not use recall as broad search or inject raw source unless it is needed.
+When exact source context is needed for precision or traceability, use the recall tool with the relevant observation or reflection id. This is especially useful when a reflection materially affects a decision or is too compressed to continue confidently. When a needed detail is missing from these memories, search earlier context with recall and a query. Recall only when the result changes the next action.
 
 ## Reflections
 [id] durable reflection
@@ -312,7 +312,9 @@ Shows full V3 ledger truth at branch tip and attempts to copy the rendered memor
 
 ## Recall flow
 
-The agent-facing `recall` tool accepts a 12-character lowercase hex id.
+The agent-facing `recall` tool takes either a `query` or an `id`.
+
+With an `id` of 12 lowercase hex characters it recovers memory evidence:
 
 1. Validate id shape.
 2. Read the current branch.
@@ -322,6 +324,12 @@ The agent-facing `recall` tool accepts a 12-character lowercase hex id.
 6. Resolve observation source entries from `sourceEntryIds`.
 7. For reflections, resolve supporting observations and their sources.
 8. Return exact evidence plus diagnostics for missing/non-source entries.
+
+An `id` of 8 lowercase hex characters is a Pi transcript entry id, as returned by search. Recall renders that source entry from the current branch.
+
+With a `query`, recall ranks with BM25 over every observation and reflection recorded on the branch, including dropped ones, plus the transcript hidden by the latest compaction: source entries before its `firstKeptEntryId`, split into chunks of about 1,200 characters. The retained tail and later entries are in context already and are not indexed. Each transcript entry contributes at most its best chunk. The top 8 hits are returned as memory lines or transcript snippets with ids that the agent can pass back to expand.
+
+With `recallEmbeddings` enabled, the lexical ranking is fused with cosine similarity from a local embedding model over the same documents. Documents are indexed in the background, and any that are not embedded yet keep their lexical rank.
 
 Recall ignores old V2 memory by construction because it indexes only V3 ledger entry types.
 

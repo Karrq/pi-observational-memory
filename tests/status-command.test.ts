@@ -16,7 +16,7 @@ import {
 	type TestEntry,
 } from "./fixtures/session.js";
 
-function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unknown; contextUsage?: unknown }) {
+function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unknown; contextUsage?: unknown; embeddings?: unknown }) {
 	let handler: ((args: unknown, ctx: any) => Promise<void>) | undefined;
 	const pi = {
 		registerCommand: vi.fn((name: string, command: { handler: typeof handler }) => {
@@ -43,13 +43,13 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 		lastDropperError: undefined,
 		...args.runtime,
 	};
-	registerStatusCommand(pi as any, runtime as any);
+	registerStatusCommand(pi as any, runtime as any, args.embeddings as any);
 	if (!handler) throw new Error("status handler not registered");
 	const notify = vi.fn();
 	const ctx = {
 		cwd: "/tmp/project",
 		ui: { notify },
-		sessionManager: { getBranch: () => args.entries },
+		sessionManager: { getBranch: () => args.entries, getSessionId: () => "s1" },
 		model: args.model,
 		getContextUsage: () => args.contextUsage,
 	};
@@ -276,5 +276,40 @@ describe("V3 /om:status", () => {
 
 			expect(output).toContain("Next compaction:  ~0 / 81,000 estimated source tokens (0%)");
 		});
+	});
+
+	it("reports the recall index when embeddings are enabled", async () => {
+		const status = vi.fn();
+		const embeddings = { status };
+		const run = () => setup({ entries: [], embeddings }).run();
+
+		status.mockReturnValue(undefined);
+		expect(await run()).not.toContain("Recall index");
+
+		status.mockReturnValue({ state: "absent", autoBuild: false, documents: 0, orphaned: 0, indexing: false });
+		expect(await run()).toContain("Recall index: none on this branch — run /om:index to build it");
+
+		status.mockReturnValue({ state: "absent", autoBuild: false, documents: 12, orphaned: 4, indexing: false });
+		const absent = await run();
+		expect(absent).toContain("Recall index: none on this branch (8 documents already embedded from other branches) — run /om:index to build it");
+		expect(absent).toContain("Recall index: 4 orphaned documents not on this branch — run /om:index to prune");
+
+		status.mockReturnValue({ state: "absent", autoBuild: true, documents: 0, orphaned: 0, indexing: false });
+		expect(await run()).toContain("Recall index: none yet — builds after the next turn");
+
+		status.mockReturnValue({ state: "present", documents: 16640, orphaned: 0, missing: 0, recentEmbedded: 30, recentTotal: 40, indexing: false });
+		const present = await run();
+		expect(present).toContain("Recall index: 16,640 documents / 30 of 40 since last compaction embedded (75%)");
+		expect(present).not.toContain("orphaned");
+
+		status.mockReturnValue({ state: "present", documents: 5, orphaned: 0, missing: 3, recentEmbedded: 0, recentTotal: 0, indexing: true });
+		// Missing documents are what the running index is embedding, so they only get a line once it is idle.
+		expect(await run()).toContain("(100%) — indexing");
+		expect(await run()).not.toContain("not embedded");
+		status.mockReturnValue({ state: "present", documents: 5, orphaned: 0, missing: 3, recentEmbedded: 0, recentTotal: 0, indexing: false });
+		expect(await run()).toContain("Recall index: 3 documents on this branch not embedded — run /om:index to embed them");
+
+		status.mockReturnValue({ state: "failed", failure: "no runtime" });
+		expect(await run()).toContain("Recall index: unavailable, using keyword search — no runtime");
 	});
 });

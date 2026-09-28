@@ -46,6 +46,12 @@ describe("V3 config", () => {
 			showWorkerNotifications: true,
 			modelMap: [],
 			selfCompact: { enabled: false, warnAt: [] },
+			recallEmbeddings: {
+				enabled: false,
+				model: "Xenova/bge-small-en-v1.5",
+				pooling: "cls",
+				queryPrefix: "Represent this sentence for searching relevant passages: ",
+			},
 			passive: false,
 			debugLog: false,
 			modelMap: [],

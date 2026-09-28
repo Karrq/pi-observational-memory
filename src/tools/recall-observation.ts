@@ -9,13 +9,27 @@ import {
 	type RecallResult,
 	type RecalledObservation,
 } from "../session-ledger/recall.js";
-import type { Observation, Reflection } from "../session-ledger/index.js";
+import {
+	buildSearchCorpus,
+	fuseScores,
+	rankLexical,
+	tokenize,
+	topHits,
+	type Observation,
+	type Reflection,
+	type SearchDocument,
+	type SearchHit,
+} from "../session-ledger/index.js";
+import { isSourceEntry } from "../session-ledger/progress.js";
 import { renderRecallSourceEntries, renderRecallSourceEntry } from "../serialize.js";
 import { estimateEntryTokens } from "../tokens.js";
 
 export const RECALL_OBSERVATION_TOOL_NAME = "recall";
 
 const MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
+const ENTRY_ID_PATTERN = /^[a-f0-9]{8}$/;
+const SEARCH_LIMIT = 8;
+const SNIPPET_CHARS = 600;
 
 type RecallObservationToolStatus =
 	| "ok"
@@ -70,6 +84,19 @@ export type RecallObservationToolDetails = {
 	sourceCharacterCount?: number;
 	message?: string;
 };
+
+export type RecallSearchDetails = {
+	mode: "search";
+	query: string;
+	semantic: boolean;
+	hits: Array<Pick<SearchHit, "kind" | "id" | "score">>;
+};
+
+type RecallToolDetails = RecallObservationToolDetails | RecallSearchDetails;
+
+function isSearchDetails(details: RecallToolDetails | undefined): details is RecallSearchDetails {
+	return (details as RecallSearchDetails | undefined)?.mode === "search";
+}
 
 function pad(n: number): string {
 	return n.toString().padStart(2, "0");
@@ -298,7 +325,7 @@ function plural(n: number, singular: string, pluralForm = `${singular}s`): strin
 }
 
 function sourceEntriesFromDetails(details: RecallObservationToolDetails): RecallSourceEntryDetails[] {
-	if (!isObservationOnly(details)) return details.sourceEntries;
+	if (!isObservationOnly(details) || details.matches.length === 0) return details.sourceEntries;
 	return details.matches.flatMap((match) => match.sourceEntries ?? []);
 }
 
@@ -388,7 +415,7 @@ function memoryRows(details: RecallObservationToolDetails): string[] {
 function noteRows(details: RecallObservationToolDetails, sources: RecallSourceEntryDetails[]): string[] {
 	const notes: string[] = [];
 	if (details.status === "invalid_id") {
-		notes.push(noteLine("invalid id", `memory ids must be 12 lowercase hex characters; received ${details.memoryId}`));
+		notes.push(noteLine("invalid id", `${details.message ?? `invalid id ${details.memoryId}`}`));
 		return notes;
 	}
 	if (details.status === "not_found") {
@@ -435,41 +462,97 @@ export function formatRecallRenderedResultForTui(result: AgentToolResult<RecallO
 	return body ? `\n${body}` : "";
 }
 
-export const recallObservationTool = defineTool({
+/** Window of a transcript chunk around its first query-term match. */
+function snippet(text: string, query: string): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= SNIPPET_CHARS) return flat;
+	const lower = flat.toLowerCase();
+	const first = tokenize(query).map((term) => lower.indexOf(term)).filter((i) => i >= 0).sort((a, b) => a - b)[0] ?? 0;
+	const start = Math.max(0, Math.min(first - SNIPPET_CHARS / 4, flat.length - SNIPPET_CHARS));
+	return `${start > 0 ? "…" : ""}${flat.slice(start, start + SNIPPET_CHARS)}${start + SNIPPET_CHARS < flat.length ? "…" : ""}`;
+}
+
+function searchHitText(hit: SearchHit, query: string): string {
+	if (hit.kind === "observation") {
+		return `[${hit.id}]${hit.dropped ? " [dropped]" : ""} observation ${hit.timestamp} [${hit.relevance}] ${hit.text}`;
+	}
+	if (hit.kind === "reflection") return `[${hit.id}] reflection ${hit.text}`;
+	return `[${hit.id}] transcript ${snippet(hit.text, query)}`;
+}
+
+/** Optional semantic scores per document; undefined falls back to lexical ranking. */
+export type VectorScorer = (sessionId: string, docs: SearchDocument[], query: string) => Promise<Array<number | undefined> | undefined>;
+
+async function searchResult(entries: Entry[], query: string, sessionId: string, vectorScores?: VectorScorer) {
+	const docs = buildSearchCorpus(entries);
+	const lexical = rankLexical(docs, query);
+	const vector = vectorScores ? await vectorScores(sessionId, docs, query) : undefined;
+	const hits = topHits(docs, vector ? fuseScores(lexical, vector) : lexical, SEARCH_LIMIT);
+	const details: RecallSearchDetails = { mode: "search", query, semantic: vector !== undefined, hits: hits.map(({ kind, id, score }) => ({ kind, id, score })) };
+	const text = hits.length === 0
+		? `No matches for "${query}".`
+		: `${hits.map((hit) => searchHitText(hit, query)).join("\n")}\n\nPass an id to recall for full evidence.`;
+	return { content: [{ type: "text" as const, text }], details };
+}
+
+function entryResult(entries: Entry[], entryId: string) {
+	const entry = entries.find((candidate) => candidate.id === entryId);
+	const rendered = entry && isSourceEntry(entry) ? renderRecallSourceEntry(entry) : null;
+	if (!entry || !rendered) {
+		const message = `No transcript entry with id ${entryId} was found on the current branch.`;
+		return textResult(message, emptyDetails("not_found", entryId, message));
+	}
+	return textResult(rendered, { ...emptyDetails("ok", entryId, ""), message: undefined, sourceEntries: [sourceEntryDetails(entry, true)] });
+}
+
+export function formatRecallSearchResultForTui(details: RecallSearchDetails): string {
+	if (details.hits.length === 0) return `\n× no matches for "${details.query}"`;
+	const rows = details.hits.map((hit) => alignedRow(`✓ ${hit.kind}`, hit.id, `score ${hit.score.toFixed(3)}`));
+	return `\n✓ ${plural(details.hits.length, "match", "matches")}${details.semantic ? " · semantic" : ""}\n\n${rows.join("\n")}`;
+}
+
+export const createRecallTool = (vectorScores?: VectorScorer) => defineTool({
 	name: RECALL_OBSERVATION_TOOL_NAME,
 	label: "Recall memory evidence",
 	description:
-		"Recover exact evidence and source context behind a compacted observational-memory observation or reflection id on the current branch. " +
-		"Use when compressed memory is important and original source context is needed before acting.",
-	promptSnippet: "Use recall(<id>) to recover exact source context behind compacted memory observations/reflections when precision matters.",
+		"Search or expand earlier session context: memory observations and reflections, plus transcript hidden by compaction. " +
+		"`query` ranks matches by keyword; `id` returns full evidence for a memory id (12 hex) or transcript entry id (8 hex).",
+	promptSnippet: "Use recall to search or expand earlier session context hidden by compaction.",
 	promptGuidelines: [
-		"Use recall before making an important decision that depends on a compacted observation or reflection whose details are unclear.",
-		"Use recall when you need exact wording, rationale, file paths, commands, errors, commits, user constraints, or provenance behind a remembered claim.",
-		"Use recall when a broad reflection is relevant but you need its supporting observations or raw sources to continue safely.",
-		"Use recall when the user asks why you believe something, what supports a memory, or what was decided earlier.",
-		"Do not use recall as semantic search or transcript browsing; you must already have a specific 12-character memory id.",
-		"Do not recall every id preemptively. Recall only when exact source context will materially improve the next action.",
+		"Use recall with query when a detail from earlier in the session is missing from context and memory: exact wording, rationale, file paths, commands, errors, or user constraints.",
+		"Use recall with id to expand a search hit or a memory line before relying on its details.",
+		"Do not recall preemptively; recall when the answer changes the next action.",
 	],
 	parameters: Type.Object({
-		id: Type.String({
-			pattern: "^[a-f0-9]{12}$",
-			description: "12-character lowercase hex observation or reflection id shown in compacted memory, /om:view, or a previous recall result. Must be a specific id; this tool does not search by topic.",
-		}),
+		query: Type.Optional(Type.String({ description: "Keywords to search for. Distinctive terms work best." })),
+		id: Type.Optional(Type.String({
+			pattern: "^([a-f0-9]{12}|[a-f0-9]{8})$",
+			description: "Memory id or transcript entry id from memory or a previous recall result.",
+		})),
 	}),
 	renderCall(args) {
-		return new Text(formatRecallCallForTui(args.id), 0, 0);
+		return new Text(formatRecallCallForTui(args.id ?? (args.query ? `"${args.query}"` : undefined)), 0, 0);
 	},
 	renderResult(result, options) {
+		const details = result.details as RecallToolDetails | undefined;
+		if (isSearchDetails(details)) return new Text(formatRecallSearchResultForTui(details), 0, 0);
 		return new Text(formatRecallRenderedResultForTui(result as AgentToolResult<RecallObservationToolDetails>, options.expanded), 0, 0);
 	},
-	async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-		const memoryId = params.id;
-		if (!MEMORY_ID_PATTERN.test(memoryId)) {
-			const message = `Memory id must be 12 lowercase hex characters. Received: ${memoryId}`;
+	async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<RecallToolDetails>> {
+		const branch = () => ctx.sessionManager.getBranch() as Entry[];
+		const query = params.query?.trim();
+		const memoryId = params.id ?? "";
+		if (query && memoryId) {
+			const message = "Pass either query or id, not both.";
 			return textResult(message, emptyDetails("invalid_id", memoryId, message));
 		}
-		const branchEntries = ctx.sessionManager.getBranch() as Entry[];
-		const result = recallMemorySources(branchEntries, memoryId);
+		if (query) return searchResult(branch(), query, ctx.sessionManager.getSessionId(), vectorScores);
+		if (ENTRY_ID_PATTERN.test(memoryId)) return entryResult(branch(), memoryId);
+		if (!MEMORY_ID_PATTERN.test(memoryId)) {
+			const message = `Pass query to search, or an id: 12 lowercase hex characters for memory, 8 for a transcript entry. Received: ${memoryId || "nothing"}`;
+			return textResult(message, emptyDetails("invalid_id", memoryId, message));
+		}
+		const result = recallMemorySources(branch(), memoryId);
 		if (result.status === "not_found") {
 			const message = `No observation or reflection with id ${memoryId} was found on the current branch.`;
 			return textResult(message, emptyDetails("not_found", memoryId, message));
@@ -478,6 +561,8 @@ export const recallObservationTool = defineTool({
 	},
 });
 
-export function registerRecallTool(pi: ExtensionAPI): void {
-	pi.registerTool(recallObservationTool);
+export const recallObservationTool = createRecallTool();
+
+export function registerRecallTool(pi: ExtensionAPI, vectorScores?: VectorScorer): void {
+	pi.registerTool(vectorScores ? createRecallTool(vectorScores) : recallObservationTool);
 }

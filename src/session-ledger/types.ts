@@ -5,6 +5,9 @@ export const OM_FOLDED = "om.folded";
 /** Context-usage nudges for self-compaction: control messages, not session content. */
 export const OM_SELF_COMPACT_WARNING = "om.self-compact.warning";
 
+/** Recall embeddings run metadata: bookkeeping, not memory. */
+export const OM_EMBEDDINGS_INDEXED = "om.embeddings.indexed";
+
 export const RELEVANCE_VALUES = ["low", "medium", "high", "critical"] as const;
 export type Relevance = (typeof RELEVANCE_VALUES)[number];
 
@@ -53,6 +56,22 @@ export type ReflectionsRecordedEntryData = {
 export type ObservationsDroppedEntryData = {
 	observationIds: string[];
 	coversUpToId: string;
+};
+
+export type EmbeddingsIndexedEntryData = {
+	/** `full` for /om:index, `auto` for the first build of an uncompacted session, `incremental` on settle. */
+	mode: "full" | "auto" | "incremental";
+	outcome: "complete" | "aborted" | "failed";
+	model: string;
+	embedded: number;
+	/** Documents the run found missing but did not embed. */
+	pending: number;
+	/** Vectors in the session's index after the run. */
+	documents: number;
+	/** Orphaned vectors (entry or memory not on the branch) a full run removed. */
+	pruned?: number;
+	throughEntryId?: string;
+	failure?: string;
 };
 
 export type MemoryDetails = {
@@ -151,6 +170,15 @@ export function isMemoryDetails(value: unknown): value is MemoryDetails {
 		Array.isArray(value.reflections) &&
 		value.reflections.every(isReflection)
 	);
+}
+
+export function isEmbeddingsIndexedEntry(entry: Entry): entry is Entry & {
+	type: "custom";
+	customType: typeof OM_EMBEDDINGS_INDEXED;
+	data: EmbeddingsIndexedEntryData;
+} {
+	if (entry.type !== "custom" || entry.customType !== OM_EMBEDDINGS_INDEXED || !isPlainRecord(entry.data)) return false;
+	return typeof entry.data.outcome === "string" && typeof entry.data.mode === "string";
 }
 
 export function isObservationsRecordedEntry(entry: Entry): entry is Entry & {
