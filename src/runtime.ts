@@ -115,6 +115,8 @@ export class Runtime {
 	consolidationPhase: ConsolidationPhase | undefined;
 	compactInFlight = false;
 	compactHookInFlight = false;
+	/** Set by `compact_context`; consumed once the agent run settles. */
+	selfCompactPending: { resume?: string } | undefined;
 	resolveFailureNotified = false;
 	lastObserverError: string | undefined;
 	lastReflectorError: string | undefined;

@@ -43,6 +43,16 @@ export interface LegacyCompactThresholdSettings {
 	compactAfterTokensRatio?: number;
 }
 
+/**
+ * Lets the agent compact its own context through the `compact_context` tool.
+ * `warnAt` thresholds resolve against the active model's context window and
+ * are compared with Pi's live context usage, not source-entry estimates.
+ */
+export interface SelfCompactConfig {
+	enabled: boolean;
+	warnAt: (number | TokenThreshold)[];
+}
+
 export interface Config {
 	observeAfterTokens: number | TokenThreshold;
 	reflectAfterTokens: number | TokenThreshold;
@@ -81,6 +91,7 @@ export interface Config {
 	 */
 	fallbackModel?: ConfiguredModel;
 	showWorkerNotifications: boolean;
+	selfCompact: SelfCompactConfig;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -104,6 +115,7 @@ export const DEFAULTS: Config = {
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
+	selfCompact: { enabled: false, warnAt: [] },
 	passive: false,
 	debugLog: false,
 };
@@ -281,6 +293,15 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	return model;
 }
 
+/** Malformed `warnAt` entries are dropped individually; a non-object block is ignored. */
+export function normalizeSelfCompact(value: unknown): SelfCompactConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	const warnAt = Array.isArray(value.warnAt)
+		? value.warnAt.map(parseTokenThreshold).filter((threshold) => threshold !== undefined)
+		: [];
+	return { enabled: value.enabled === true, warnAt };
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -295,6 +316,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"reflectAfterTokens",
 		"compactAfterTokens",
 	] as const;
+	const selfCompact = normalizeSelfCompact(value.selfCompact);
+	if (selfCompact) normalized.selfCompact = selfCompact;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
