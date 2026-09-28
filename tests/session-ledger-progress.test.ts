@@ -33,6 +33,7 @@ describe("session-ledger V3 progress helpers", () => {
 	it("detects only raw/source entries as source entries", () => {
 		expect(isSourceEntry(textCustomMessage("raw-1", "abcd"))).toBe(true);
 		expect(isSourceEntry(branchSummary("sum-1", "abcd"))).toBe(true);
+		expect(isSourceEntry(textCustomMessage("warn-1", "abcd", { customType: "om.self-compact.warning" }))).toBe(false);
 		expect(isSourceEntry(observationsRecordedEntry("om-1", {
 			observations: [observation("aaaaaaaaaaaa")],
 			coversUpToId: "raw-1",

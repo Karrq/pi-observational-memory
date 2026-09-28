@@ -3,6 +3,7 @@ import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
 	OM_REFLECTIONS_RECORDED,
+	OM_SELF_COMPACT_WARNING,
 	type Entry,
 	type V3MemoryCustomType,
 } from "./types.js";
@@ -10,6 +11,7 @@ import {
 const SOURCE_ENTRY_TYPES = new Set(["message", "custom_message", "branch_summary"]);
 
 export function isSourceEntry(entry: Entry): boolean {
+	if (entry.type === "custom_message" && entry.customType === OM_SELF_COMPACT_WARNING) return false;
 	return SOURCE_ENTRY_TYPES.has(entry.type);
 }
 

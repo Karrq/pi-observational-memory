@@ -75,6 +75,8 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `fallbackModel.provider` | string | unset | Provider name in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.id` | string | unset | Model id in Pi's model registry. Required when `fallbackModel` is set. |
 | `fallbackModel.thinking` | enum | unset; falls back to `model.thinking` then `low` | Optional reasoning/thinking level used when the fallback is active. |
+| `selfCompact.enabled` | boolean | `false` | Gives the agent the `compact_context` tool so it can compact at a breakpoint it chooses. |
+| `selfCompact.warnAt` | array of thresholds | `[]` | Context-usage levels at which the agent is asked to call `compact_context`. Same number or `{ type, value }` forms as other thresholds. |
 | `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
@@ -212,6 +214,28 @@ Once the fallback resolves, it is reused for the rest of the consolidation pass,
 If the fallback advertises a smaller context window than the primary, the observer chunk is capped to the smaller window before the run, so a fallback retry is never handed a prompt sized only for a larger primary. `fallbackModel.thinking`, when set, is the thinking level used for the fallback call.
 
 `provider` and `id` must both be non-empty strings, exactly as for `model`. A `fallbackModel` identical to the effective primary memory model — the configured `model` when it resolves, otherwise the session model — is rejected as a misconfiguration. A fallback that also fails leaves the existing skip/fail-safe behavior intact: no memory is invented, coverage does not advance, and the failure is surfaced (worker failure notification, `/om:status`, debug log).
+
+## `selfCompact`
+
+Default: `{ "enabled": false }`.
+
+When enabled, the agent gets a `compact_context` tool. Calling it ends the current run; once Pi settles, the extension compacts through the normal V3 hook, so memory is rendered without a model call and recent turns stay in the retained tail. If the agent passed `resume`, that note comes back as a message that starts the next turn. Without it, the agent stays idle after compaction. A failed compaction is reported to the agent only when it asked to resume, so it can continue without compacting.
+
+Input that arrives before the compaction starts cancels it. Proactive `compactAfterTokens` compaction keeps working as a backstop.
+
+`warnAt` asks the agent to compact as context fills. Each threshold is compared with Pi's live context usage, which includes the system prompt and tool schemas, unlike `compactAfterTokens`. Each level is sent once per compaction cycle. The highest level asks the agent to compact before starting new work, and lower levels ask for the next clean breakpoint. A warning raised mid-run is steered into the current run. One raised after the final reply is attached to your next prompt instead of starting a turn. Warnings are not treated as session content by the observer.
+
+```json
+{
+  "observational-memory": {
+    "compactAfterTokens": { "type": "ratio", "value": 0.35 },
+    "selfCompact": {
+      "enabled": true,
+      "warnAt": [{ "type": "ratio", "value": 0.2 }, { "type": "ratio", "value": 0.28 }]
+    }
+  }
+}
+```
 
 ## `showWorkerNotifications`
 

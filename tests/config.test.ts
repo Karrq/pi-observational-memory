@@ -45,11 +45,25 @@ describe("V3 config", () => {
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
 			modelMap: [],
+			selfCompact: { enabled: false, warnAt: [] },
 			passive: false,
 			debugLog: false,
 			modelMap: [],
 		});
 		expect(loadConfig(cwd, {})).toEqual(DEFAULTS);
+	});
+
+	it("parses selfCompact and drops malformed warning thresholds", () => {
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": {
+				selfCompact: { enabled: true, warnAt: [{ type: "ratio", value: 0.2 }, 50_000, "bad", { type: "ratio", value: 2 }] },
+			},
+		});
+
+		expect(loadConfig(cwd, {}).selfCompact).toEqual({
+			enabled: true,
+			warnAt: [{ type: "ratio", value: 0.2 }, 50_000],
+		});
 	});
 
 	it("merges global, project, and env V3 settings in order", () => {

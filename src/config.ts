@@ -67,6 +67,16 @@ export interface ModelMapEntry {
 	thinking?: ModelThinkingLevel;
 }
 
+/**
+ * Lets the agent compact its own context through the `compact_context` tool.
+ * `warnAt` thresholds resolve against the active model's context window and
+ * are compared with Pi's live context usage, not source-entry estimates.
+ */
+export interface SelfCompactConfig {
+	enabled: boolean;
+	warnAt: (number | TokenThreshold)[];
+}
+
 export interface Config {
 	observeAfterTokens: number | TokenThreshold;
 	reflectAfterTokens: number | TokenThreshold;
@@ -106,6 +116,7 @@ export interface Config {
 	fallbackModel?: ConfiguredModel;
 	showWorkerNotifications: boolean;
 	modelMap: ModelMapEntry[];
+	selfCompact: SelfCompactConfig;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -130,6 +141,7 @@ export const DEFAULTS: Config = {
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
 	modelMap: [],
+	selfCompact: { enabled: false, warnAt: [] },
 	passive: false,
 	debugLog: false,
 };
@@ -384,6 +396,15 @@ export function resolveConfiguredModel(
 	return config.model;
 }
 
+/** Malformed `warnAt` entries are dropped individually; a non-object block is ignored. */
+export function normalizeSelfCompact(value: unknown): SelfCompactConfig | undefined {
+	if (!isRecord(value)) return undefined;
+	const warnAt = Array.isArray(value.warnAt)
+		? value.warnAt.map(parseTokenThreshold).filter((threshold) => threshold !== undefined)
+		: [];
+	return { enabled: value.enabled === true, warnAt };
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
@@ -400,6 +421,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	] as const;
 	const modelMap = normalizeModelMap(value.modelMap);
 	if (modelMap) normalized.modelMap = modelMap;
+	const selfCompact = normalizeSelfCompact(value.selfCompact);
+	if (selfCompact) normalized.selfCompact = selfCompact;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;

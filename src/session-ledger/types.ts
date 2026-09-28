@@ -2,6 +2,8 @@ export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
 export const OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
 export const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
 export const OM_FOLDED = "om.folded";
+/** Context-usage nudges for self-compaction: control messages, not session content. */
+export const OM_SELF_COMPACT_WARNING = "om.self-compact.warning";
 
 export const RELEVANCE_VALUES = ["low", "medium", "high", "critical"] as const;
 export type Relevance = (typeof RELEVANCE_VALUES)[number];
