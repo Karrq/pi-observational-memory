@@ -78,7 +78,7 @@ Every V3 ledger entry has `data.coversUpToId`. That field is a progress and proj
 | Dropper | latest `om.observations.dropped.data.coversUpToId` |
 | Auto-compaction | latest compaction boundary |
 
-The watermark is also used to decide whether a memory ledger entry belongs to a bounded projection. It is not provenance. Provenance lives in `sourceEntryIds` and `supportingObservationIds`.
+The watermark is also used to decide whether a memory ledger entry belongs to a bounded projection; for observations, citing a source entry before the boundary also qualifies. It is not provenance. Provenance lives in `sourceEntryIds` and `supportingObservationIds`.
 
 ## Ledger data shapes
 
@@ -246,7 +246,7 @@ V3 uses projection helpers so commands, compaction, and recall do not each inven
 
 ### Full projection
 
-Full projection folds valid V3 observations, reflections, and drops from branch root through the requested boundary. Memory entries are included by resolving their `data.coversUpToId` marker against the boundary, not by the physical position of the `om.*` custom entry. Old V2 entries/details, invalid V3-shaped entries, and dangling coverage markers are ignored.
+Full projection folds valid V3 observations, reflections, and drops from branch root through the requested boundary. Memory entries are included by resolving their `data.coversUpToId` marker against the boundary, not by the physical position of the `om.*` custom entry. An observation batch whose marker runs past the boundary still contributes the observations whose `sourceEntryIds` cite an entry before it, since the boundary leaves no transcript for those entries. Old V2 entries/details, invalid V3-shaped entries, and dangling coverage markers are ignored.
 
 ### Visible projection
 
