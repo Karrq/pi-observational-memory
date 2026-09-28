@@ -1,5 +1,5 @@
 import { renderRecallSourceEntry } from "../serialize.js";
-import { entryIndexForId, findLastCompactionIndex, isSourceEntry } from "./progress.js";
+import { entryIndexForId, isSourceEntry } from "./progress.js";
 import {
 	isObservationsDroppedEntry,
 	isObservationsRecordedEntry,
@@ -50,27 +50,39 @@ function chunkText(text: string): string[] {
 }
 
 /**
+ * End of the hidden transcript among the first `length` entries: the latest
+ * compaction's retained tail, or 0 when nothing is compacted yet.
+ */
+function hiddenEnd(entries: Entry[], length: number): number {
+	let compactionIndex = length - 1;
+	while (compactionIndex >= 0 && entries[compactionIndex].type !== "compaction") compactionIndex--;
+	if (compactionIndex === -1) return 0;
+	const firstKeptIndex = entryIndexForId(entries, entries[compactionIndex].firstKeptEntryId);
+	return firstKeptIndex === -1 ? compactionIndex : firstKeptIndex;
+}
+
+/**
  * Transcript entries the agent cannot see: source entries before the latest
  * compaction's retained tail. Without a compaction the whole branch is in
  * context and nothing is hidden.
  */
 export function hiddenSourceEntries(entries: Entry[]): Entry[] {
-	const compactionIndex = findLastCompactionIndex(entries);
-	if (compactionIndex === -1) return [];
-	const firstKeptIndex = entryIndexForId(entries, entries[compactionIndex].firstKeptEntryId);
-	const end = firstKeptIndex === -1 ? compactionIndex : firstKeptIndex;
-	return entries.slice(0, end).filter(isSourceEntry);
+	return entries.slice(0, hiddenEnd(entries, entries.length)).filter(isSourceEntry);
 }
 
-/** Every observation and reflection ever recorded on the branch, plus hidden transcript chunks. */
-export function buildSearchCorpus(entries: Entry[]): SearchDocument[] {
+/**
+ * Every observation and reflection ever recorded on the branch, plus hidden transcript chunks.
+ * With `from`, only what entries from that index on added: memory they record, and transcript
+ * a compaction among them newly hid.
+ */
+export function buildSearchCorpus(entries: Entry[], from = 0): SearchDocument[] {
 	const droppedObservations = new Set<string>();
 	for (const entry of entries) {
 		if (isObservationsDroppedEntry(entry)) entry.data.observationIds.forEach((id) => droppedObservations.add(id));
 	}
 
 	const docs: SearchDocument[] = [];
-	for (const entry of entries) {
+	for (const entry of entries.slice(from)) {
 		if (isObservationsRecordedEntry(entry)) {
 			for (const observation of entry.data.observations) {
 				docs.push({
@@ -88,7 +100,8 @@ export function buildSearchCorpus(entries: Entry[]): SearchDocument[] {
 			}
 		}
 	}
-	for (const entry of hiddenSourceEntries(entries)) {
+	const hidden = entries.slice(from === 0 ? 0 : hiddenEnd(entries, from), hiddenEnd(entries, entries.length)).filter(isSourceEntry);
+	for (const entry of hidden) {
 		const rendered = renderRecallSourceEntry(entry);
 		if (!rendered) continue;
 		chunkText(rendered).forEach((text, chunk) => docs.push({ kind: "entry", id: entry.id, text, chunk }));

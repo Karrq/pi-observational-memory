@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import { resolveCompactAfterTokens } from "../config.js";
+import type { IndexStatus, SessionEmbeddings } from "../embeddings.js";
 import type { Runtime } from "../runtime.js";
 import {
 	diffProjection,
@@ -34,7 +35,32 @@ function appendSuffixes(line: string, suffixes: (string | undefined)[]): string 
 	return rendered.length > 0 ? `${line} ${rendered.join(" ")}` : line;
 }
 
-export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void {
+function recallIndexLines(status: IndexStatus): string[] {
+	if (status.state === "failed") return [`Recall index: unavailable, using keyword search — ${status.failure}`];
+	const orphaned = status.orphaned > 0
+		? [`Recall index: ${status.orphaned.toLocaleString()} orphaned documents not on this branch — run /om:index to prune`]
+		: [];
+	const missing = status.state === "present" && status.missing > 0 && !status.indexing
+		? [`Recall index: ${status.missing.toLocaleString()} documents on this branch not embedded — run /om:index to embed them`]
+		: [];
+	return [recallIndexLine(status), ...missing, ...orphaned];
+}
+
+function recallIndexLine(status: Exclude<IndexStatus, { state: "failed" }>): string {
+	if (status.state === "absent") {
+		if (status.indexing) return "Recall index: building";
+		if (status.autoBuild) return "Recall index: none yet — builds after the next turn";
+		const shared = status.documents > status.orphaned
+			? ` (${(status.documents - status.orphaned).toLocaleString()} documents already embedded from other branches)`
+			: "";
+		return `Recall index: none on this branch${shared} — run /om:index to build it`;
+	}
+	const line = `Recall index: ${status.documents.toLocaleString()} documents / ${status.recentEmbedded.toLocaleString()} of ${status.recentTotal.toLocaleString()} since last compaction embedded (${status.recentTotal === 0 ? 100 : pct(status.recentEmbedded, status.recentTotal)}%)`;
+	if (status.indexing) return `${line} — indexing`;
+	return line;
+}
+
+export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime, embeddings?: SessionEmbeddings): void {
 	pi.registerCommand("om:status", {
 		description: "Show observational memory status",
 		handler: async (_args, ctx) => {
@@ -87,6 +113,8 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`Active observation pool: ~${activeObservationPool.observationTokens.toLocaleString()} / ${runtime.config.observationsPoolTargetTokens.toLocaleString()} target tokens (${pct(activeObservationPool.observationTokens, runtime.config.observationsPoolTargetTokens)}%)`,
 				`Reflection pool:         ~${visibleReflectionTokens.toLocaleString()} tokens`,
 			];
+			const indexStatus = embeddings?.status(ctx.sessionManager.getSessionId(), entries);
+			if (indexStatus) lines.push(...recallIndexLines(indexStatus));
 
 			if (runtime.consolidationInFlight || runtime.compactInFlight || runtime.compactHookInFlight) {
 				lines.push("", "── In flight ──");

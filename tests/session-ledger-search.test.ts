@@ -33,6 +33,24 @@ describe("session search", () => {
 		expect(buildSearchCorpus(entries.slice(0, -1)).some((doc) => doc.kind === "entry")).toBe(false);
 	});
 
+	it("from an index, covers only memory recorded there and transcript a compaction there newly hid", () => {
+		const later = [
+			...entries,
+			rawMessage("aaaa0004", "After the first compaction."),
+			observationsRecordedEntry("om-4", {
+				observations: [observation("cccccccccccc", { content: "Later observation." })],
+				coversUpToId: "aaaa0004",
+			}),
+			rawMessage("aaaa0005", "Kept tail."),
+			compactionEntry("cmp-2", { firstKeptEntryId: "aaaa0005" }),
+		];
+
+		const docs = buildSearchCorpus(later, entries.length);
+
+		expect(docs.map((doc) => doc.id)).toEqual(["cccccccccccc", "aaaa0003", "aaaa0004"]);
+		expect(buildSearchCorpus(later, later.length)).toEqual([]);
+	});
+
 	it("ranks matches and returns each transcript entry once", () => {
 		const hits = searchSession(entries, "sqlite busy", 8);
 

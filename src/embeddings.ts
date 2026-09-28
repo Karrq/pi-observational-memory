@@ -4,7 +4,17 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import type { RecallEmbeddingsConfig } from "./config.js";
 import { safeDebugLogSessionId } from "./debug-log.js";
-import { buildSearchCorpus, type Entry, type SearchDocument } from "./session-ledger/index.js";
+import {
+	buildSearchCorpus,
+	entryIndexById,
+	findLastCompactionIndex,
+	isEmbeddingsIndexedEntry,
+	isObservationsRecordedEntry,
+	isReflectionsRecordedEntry,
+	type EmbeddingsIndexedEntryData,
+	type Entry,
+	type SearchDocument,
+} from "./session-ledger/index.js";
 
 export const EMBEDDINGS_RELATIVE_DIR = join("observational-memory", "embeddings");
 export const MODELS_RELATIVE_DIR = join("observational-memory", "models");
@@ -12,6 +22,59 @@ export const MODELS_RELATIVE_DIR = join("observational-memory", "models");
 const BATCH_SIZE = 16;
 /** Persist partial progress so an exit mid-index keeps most of the work. */
 const SAVE_EVERY_BATCHES = 20;
+
+/** `pruned` counts orphaned vectors a full run removed before embedding. */
+export type IndexProgress = { done: number; total: number; pruned: number };
+export type IndexOptions = { signal?: AbortSignal; onProgress?: (progress: IndexProgress) => void };
+/** How a run ended: every document embedded, stopped early, or failed (the reason is in `failure`). */
+export type IndexOutcome = "complete" | "aborted" | "failed";
+
+export type IndexStatus =
+	| { state: "failed"; failure: string }
+	/**
+	 * No completed run on this branch; `autoBuild` when nothing is compacted, so the next settle
+	 * builds one. `documents` counts vectors other branches of the session already embedded.
+	 */
+	| { state: "absent"; autoBuild: boolean; documents: number; orphaned: number; indexing: boolean }
+	/**
+	 * `orphaned` counts vectors whose entry or memory is not on this branch; /om:index prunes them.
+	 * `missing` counts branch documents without a vector, which settles do not reach when they
+	 * precede the cursor (pruned by /om:index on another branch); /om:index re-embeds them.
+	 */
+	| { state: "present"; documents: number; orphaned: number; missing: number; recentEmbedded: number; recentTotal: number; indexing: boolean };
+
+type RunSummary = { embedded: number; missing: number; pruned: number; through?: string };
+
+/**
+ * Whether a stored vector belongs to this branch: its entry or memory id is on it. A transcript
+ * entry still visible here counts too, since a compaction on this branch will hide it.
+ */
+function onBranch(entries: Entry[]): (key: string) => boolean {
+	const ids = new Set<string>();
+	for (const entry of entries) {
+		ids.add(entry.id);
+		if (isObservationsRecordedEntry(entry)) entry.data.observations.forEach((observation) => ids.add(observation.id));
+		else if (isReflectionsRecordedEntry(entry)) entry.data.reflections.forEach((reflection) => ids.add(reflection.id));
+	}
+	return (key) => ids.has(key.split(":")[1] ?? "");
+}
+
+/**
+ * Branch index of the entry the latest completed run on this branch embedded through, or -1.
+ * The cursor lives on the branch rather than in the store, which every branch of a session
+ * shares, so tree navigation lands on the cursor of the branch it lands on. A run that ended
+ * after navigating away records a cursor from the other branch; earlier runs stand in for it.
+ */
+function branchCursor(entries: Entry[]): number {
+	const indexById = entryIndexById(entries);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (!isEmbeddingsIndexedEntry(entry) || entry.data.outcome !== "complete" || !entry.data.throughEntryId) continue;
+		const cursor = indexById.get(entry.data.throughEntryId);
+		if (cursor !== undefined) return cursor;
+	}
+	return -1;
+}
 
 export type Embedder = { embed(texts: string[]): Promise<Float32Array[]> };
 export type EmbedderLoader = (config: RecallEmbeddingsConfig) => Promise<Embedder>;
@@ -55,6 +118,10 @@ class VectorStore {
 		}
 	}
 
+	get size(): number {
+		return this.keys.length;
+	}
+
 	has(key: string): boolean {
 		return this.index.has(key);
 	}
@@ -62,6 +129,21 @@ class VectorStore {
 	get(key: string): Float32Array | undefined {
 		const i = this.index.get(key);
 		return i === undefined ? undefined : this.vectors[i];
+	}
+
+	get allKeys(): readonly string[] {
+		return this.keys;
+	}
+
+	/** Drop every vector whose key fails `keep`; returns how many were dropped. */
+	prune(keep: (key: string) => boolean): number {
+		const keys = this.keys;
+		const vectors = this.vectors;
+		this.index.clear();
+		this.keys = [];
+		this.vectors = [];
+		keys.forEach((key, i) => keep(key) && this.add(key, vectors[i]));
+		return keys.length - this.keys.length;
 	}
 
 	add(key: string, vector: Float32Array): void {
@@ -97,7 +179,7 @@ function dot(a: Float32Array, b: Float32Array): number {
 export class SessionEmbeddings {
 	private embedder: Promise<Embedder> | undefined;
 	private store: { sessionId: string; store: VectorStore } | undefined;
-	private indexing: Promise<void> | undefined;
+	private indexing: Promise<IndexOutcome> | undefined;
 	failure: string | undefined;
 	failureNotified = false;
 
@@ -105,6 +187,11 @@ export class SessionEmbeddings {
 		private readonly getConfig: () => RecallEmbeddingsConfig,
 		private readonly loadEmbedder: EmbedderLoader = loadTransformersEmbedder,
 		private readonly baseDir: () => string = () => join(getAgentDir(), EMBEDDINGS_RELATIVE_DIR),
+		/**
+		 * Records a run on the current branch when it ends in the session that started it, except
+		 * settle runs that found nothing to embed. Incremental runs read their cursor back from these records.
+		 */
+		private readonly onRunEnd?: (data: EmbeddingsIndexedEntryData) => void,
 	) {}
 
 	private enabled(): boolean {
@@ -127,27 +214,134 @@ export class SessionEmbeddings {
 		return this.store.store;
 	}
 
-	/** Start embedding documents that have no vector yet; a no-op while a run is active. */
-	scheduleIndex(sessionId: string, entries: Entry[]): Promise<void> | undefined {
-		if (!this.enabled() || this.indexing) return this.indexing;
-		this.indexing = this.index(sessionId, entries).catch(() => {}).finally(() => { this.indexing = undefined; });
-		return this.indexing;
+	get isIndexing(): boolean {
+		return this.indexing !== undefined;
 	}
 
-	private async index(sessionId: string, entries: Entry[]): Promise<void> {
+	/**
+	 * Embed every document on the branch that has no vector yet. Builds the index
+	 * from scratch for a session without one; a no-op while a run is active.
+	 */
+	scheduleIndex(sessionId: string, entries: Entry[], options: IndexOptions = {}): Promise<IndexOutcome> | undefined {
+		if (!this.enabled() || this.indexing) return this.indexing;
+		return this.run(sessionId, "full", (summary) => {
+			// Only an explicit full run prunes: navigating back to a pruned branch needs another one to re-embed it.
+			summary.pruned = this.storeFor(sessionId).prune(onBranch(entries));
+			return this.index(sessionId, entries, buildSearchCorpus(entries), summary, options);
+		});
+	}
+
+	/**
+	 * Embed only what the branch added since the last run on it. A branch without
+	 * a run gets its index built only while nothing is compacted: until then its
+	 * corpus is memory alone, which is small. Past that, building it is a full pass
+	 * over the session, which is left to an explicit request.
+	 */
+	scheduleIncrementalIndex(sessionId: string, entries: Entry[]): Promise<IndexOutcome> | undefined {
+		if (!this.enabled() || this.indexing) return this.indexing;
+		const cursor = branchCursor(entries);
+		if (cursor === -1) {
+			if (findLastCompactionIndex(entries) !== -1) return undefined;
+			return this.run(sessionId, "auto", (summary) => this.index(sessionId, entries, buildSearchCorpus(entries), summary, {}));
+		}
+		return this.run(sessionId, "incremental", (summary) => this.index(sessionId, entries, buildSearchCorpus(entries, cursor + 1), summary, {}));
+	}
+
+	private run(sessionId: string, mode: EmbeddingsIndexedEntryData["mode"], work: (summary: RunSummary) => Promise<IndexOutcome>): Promise<IndexOutcome> {
+		const summary: RunSummary = { embedded: 0, missing: 0, pruned: 0 };
+		let failure: string | undefined;
+		const indexing = work(summary)
+			.catch((error: unknown) => {
+				failure = error instanceof Error ? error.message : String(error);
+				return "failed" as const;
+			})
+			.then((outcome) => {
+				this.recordRun(sessionId, mode, outcome, summary, failure);
+				return outcome;
+			})
+			.finally(() => { this.indexing = undefined; });
+		this.indexing = indexing;
+		return indexing;
+	}
+
+	private recordRun(sessionId: string, mode: EmbeddingsIndexedEntryData["mode"], outcome: IndexOutcome, summary: RunSummary, failure: string | undefined): void {
+		// The entry lands on whichever session is current; a run abandoned by a switch has none to land on.
+		if (!this.onRunEnd || this.store?.sessionId !== sessionId) return;
+		// Settles run every turn; one that found nothing would only grow the session. The cursor it
+		// would record lags instead, and the next run re-reads a range that is already embedded.
+		// An auto run is recorded regardless: its entry is what makes later settles incremental.
+		if (mode === "incremental" && outcome === "complete" && summary.missing === 0) return;
+		const store = this.store.store;
+		try {
+			this.onRunEnd({
+				mode,
+				outcome,
+				model: this.getConfig().model,
+				embedded: summary.embedded,
+				pending: summary.missing - summary.embedded,
+				documents: store.size,
+				...(summary.pruned > 0 ? { pruned: summary.pruned } : {}),
+				...(outcome === "complete" && summary.through ? { throughEntryId: summary.through } : {}),
+				...(failure ? { failure } : {}),
+			});
+		} catch {
+			// Recording is bookkeeping; a failed append leaves the index itself intact.
+		}
+	}
+
+	private async index(sessionId: string, entries: Entry[], docs: SearchDocument[], summary: RunSummary, options: IndexOptions): Promise<IndexOutcome> {
 		const store = this.storeFor(sessionId);
-		const missing = buildSearchCorpus(entries).filter((doc) => !store.has(docKey(doc)));
-		if (missing.length === 0) return;
+		const missing = docs.filter((doc) => !store.has(docKey(doc)));
+		summary.missing = missing.length;
+		options.onProgress?.({ done: 0, total: missing.length, pruned: summary.pruned });
+		if (missing.length === 0) {
+			summary.through = entries.at(-1)?.id;
+			if (summary.pruned > 0) store.save();
+			return "complete";
+		}
 		const embedder = await this.getEmbedder();
+		let outcome: IndexOutcome = "complete";
 		for (let start = 0, batch = 1; start < missing.length; start += BATCH_SIZE, batch++) {
 			// A session switch mid-run abandons the old session's remaining work.
-			if (this.store?.sessionId !== sessionId) break;
+			if (this.store?.sessionId !== sessionId || options.signal?.aborted) {
+				outcome = "aborted";
+				break;
+			}
 			const docs = missing.slice(start, start + BATCH_SIZE);
 			const vectors = await embedder.embed(docs.map((doc) => doc.text));
 			docs.forEach((doc, i) => store.add(docKey(doc), vectors[i]));
+			summary.embedded += docs.length;
+			options.onProgress?.({ done: Math.min(start + BATCH_SIZE, missing.length), total: missing.length, pruned: summary.pruned });
 			if (batch % SAVE_EVERY_BATCHES === 0) store.save();
 		}
+		// An interrupted run keeps its vectors but not the cursor: what it skipped is still missing.
+		if (outcome === "complete") summary.through = entries.at(-1)?.id;
 		store.save();
+		return outcome;
+	}
+
+	/** Index state for /om:status; undefined when embeddings are disabled in settings. */
+	status(sessionId: string, entries: Entry[]): IndexStatus | undefined {
+		if (!this.getConfig().enabled) return undefined;
+		if (this.failure !== undefined) return { state: "failed", failure: this.failure };
+		const store = this.storeFor(sessionId);
+		const compactionIndex = findLastCompactionIndex(entries);
+		const belongs = onBranch(entries);
+		const orphaned = store.allKeys.filter((key) => !belongs(key)).length;
+		if (branchCursor(entries) === -1) {
+			return { state: "absent", autoBuild: compactionIndex === -1, documents: store.size, orphaned, indexing: this.isIndexing };
+		}
+		// What the latest compaction hid plus memory recorded since; the whole corpus when nothing is compacted.
+		const recent = buildSearchCorpus(entries, Math.max(0, compactionIndex));
+		return {
+			state: "present",
+			documents: store.size,
+			orphaned,
+			missing: buildSearchCorpus(entries).filter((doc) => !store.has(docKey(doc))).length,
+			recentEmbedded: recent.filter((doc) => store.has(docKey(doc))).length,
+			recentTotal: recent.length,
+			indexing: this.isIndexing,
+		};
 	}
 
 	/** Cosine similarity per document, undefined for documents not embedded yet; undefined overall when disabled or failing. */
