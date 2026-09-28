@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { registerSelfCompact, SELF_COMPACT_RESUME_TYPE, SELF_COMPACT_TOOL_NAME } from "../src/hooks/self-compact.js";
 
-function setup() {
+function setup(warnAt: unknown[] = []) {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	let tool: any;
 	const pi = {
@@ -14,18 +14,31 @@ function setup() {
 	};
 	const runtime = {
 		ensureConfig: vi.fn(),
-		config: { selfCompact: { enabled: true, warnAt: [] } },
+		config: { selfCompact: { enabled: true, warnAt } },
 		compactInFlight: false,
 		selfCompactPending: undefined as unknown,
 	};
 	registerSelfCompact(pi as any, runtime as any);
-	const ctx = { cwd: "/tmp/project", hasUI: false, isIdle: vi.fn(() => true), compact: vi.fn() };
+	const usage = { tokens: 0 as number | null, contextWindow: 100_000, percent: null };
+	const branch: any[] = [];
+	const ctx = {
+		cwd: "/tmp/project",
+		hasUI: false,
+		isIdle: vi.fn(() => true),
+		compact: vi.fn(),
+		getContextUsage: () => usage,
+		sessionManager: { getBranch: () => branch },
+	};
 	handlers.get("session_start")!({ type: "session_start" }, ctx);
 	const settle = async () => {
 		handlers.get("agent_settled")!({ type: "agent_settled" }, ctx);
 		await vi.runAllTimersAsync();
 	};
-	return { pi, runtime, ctx, settle, tool: () => tool };
+	const turnEnd = (tokens: number, toolResults: unknown[] = [{}]) => {
+		usage.tokens = tokens;
+		handlers.get("turn_end")!({ type: "turn_end", toolResults }, ctx);
+	};
+	return { pi, runtime, ctx, settle, turnEnd, branch, tool: () => tool };
 }
 
 describe("self-compact", () => {
@@ -66,5 +79,21 @@ describe("self-compact", () => {
 			expect.objectContaining({ content: expect.stringContaining("Compaction failed: Nothing to compact") }),
 			{ triggerTurn: true },
 		);
+	});
+
+	it("warns once per threshold per compaction cycle, attaching idle warnings to the next prompt", () => {
+		const { pi, turnEnd, branch } = setup([{ type: "ratio", value: 0.2 }, { type: "ratio", value: 0.28 }]);
+		const warnings = () => pi.sendMessage.mock.calls.map(([message, options]: any[]) => [message.details.level, options.deliverAs]);
+
+		turnEnd(19_000);
+		turnEnd(21_000);
+		turnEnd(22_000);
+		turnEnd(29_000, []);
+		expect(warnings()).toEqual([[1, "steer"], [2, "nextTurn"]]);
+		expect(pi.sendMessage.mock.calls[1][0].content).toContain("before starting any new work");
+
+		branch.push({ type: "compaction", id: "cmp-1" });
+		turnEnd(21_000);
+		expect(warnings().at(-1)).toEqual([1, "steer"]);
 	});
 });

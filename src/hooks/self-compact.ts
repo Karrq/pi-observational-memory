@@ -1,7 +1,9 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { resolveTokenThreshold } from "../config.js";
 import type { Runtime } from "../runtime.js";
+import { OM_SELF_COMPACT_WARNING, type Entry } from "../session-ledger/index.js";
 
 export const SELF_COMPACT_TOOL_NAME = "compact_context";
 export const SELF_COMPACT_RESUME_TYPE = "om.self-compact.resume";
@@ -35,8 +37,23 @@ function sendResume(pi: ExtensionAPI, resume: string | undefined, failure?: stri
 	pi.sendMessage({ customType: SELF_COMPACT_RESUME_TYPE, content, display: true }, { triggerTurn: true });
 }
 
+/** Highest warning level already sent since the latest compaction, read from the branch so reloads do not repeat it. */
+function warnedLevelSinceCompaction(entries: Entry[]): { cycle: string; level: number } {
+	let level = 0;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type === "compaction") return { cycle: entry.id, level };
+		if (entry.type !== "custom_message" || entry.customType !== OM_SELF_COMPACT_WARNING) continue;
+		const sent = (entry.details as { level?: unknown } | undefined)?.level;
+		if (typeof sent === "number" && sent > level) level = sent;
+	}
+	return { cycle: "", level };
+}
+
 export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 	let registered = false;
+	// Queued warnings reach the branch only when delivered.
+	let queued = { cycle: "", level: 0 };
 
 	pi.on("session_start", (_event, ctx) => {
 		runtime.ensureConfig(ctx.cwd);
@@ -51,6 +68,34 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 		} else if (!enabled && active.includes(SELF_COMPACT_TOOL_NAME)) {
 			pi.setActiveTools(active.filter((name) => name !== SELF_COMPACT_TOOL_NAME));
 		}
+	});
+
+	pi.on("turn_end", (event, ctx: ExtensionContext) => {
+		const { enabled, warnAt } = runtime.config.selfCompact;
+		if (!enabled || warnAt.length === 0 || runtime.selfCompactPending) return;
+		const usage = ctx.getContextUsage();
+		if (!usage || usage.tokens === null) return;
+		const tokens = usage.tokens;
+		// A ratio without a known window never fires.
+		const thresholds = warnAt.map((threshold) => resolveTokenThreshold(threshold, usage.contextWindow, Infinity));
+		const level = thresholds.filter((threshold) => tokens >= threshold).length;
+		if (level === 0) return;
+
+		const sent = warnedLevelSinceCompaction(ctx.sessionManager.getBranch() as Entry[]);
+		const already = Math.max(sent.level, queued.cycle === sent.cycle ? queued.level : 0);
+		if (level <= already) return;
+		queued = { cycle: sent.cycle, level };
+
+		const percent = usage.contextWindow > 0 ? Math.round((tokens / usage.contextWindow) * 100) : undefined;
+		const used = percent === undefined ? `${tokens} tokens` : `${percent}% (${tokens} of ${usage.contextWindow} tokens)`;
+		const ask = level === thresholds.length
+			? "Call compact_context before starting any new work."
+			: "Call compact_context at the next clean breakpoint.";
+		// A turn without tool results ends the run; attach to the next prompt instead of starting a turn.
+		pi.sendMessage(
+			{ customType: OM_SELF_COMPACT_WARNING, content: `Context used: ${used}. ${ask}`, display: true, details: { level } },
+			{ deliverAs: event.toolResults.length > 0 ? "steer" : "nextTurn" },
+		);
 	});
 
 	// Registered before the proactive trigger so an agent-requested compaction
