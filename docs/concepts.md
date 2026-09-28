@@ -158,7 +158,7 @@ Visible and full memory can differ intentionally. Background ledger work may hap
 
 ## Recall
 
-`recall` is an agent-facing tool, not a search command. It takes a specific 12-character memory id and looks it up in V3 ledger history on the current branch.
+`recall` is an agent-facing tool with two modes. With a `query` it searches observations, reflections, and transcript hidden by compaction by keyword. With an `id` it looks up a specific 12-character memory id in V3 ledger history, or an 8-character transcript entry id, on the current branch.
 
 Recall can return:
 
@@ -204,7 +204,7 @@ When upgrading from V2, update settings and start a new clean session.
 | Observer | Background agent that records observations. |
 | Reflector | Background agent that records durable reflections. |
 | Dropper | Background agent that drops active observations by id. |
-| Recall | Agent tool for exact evidence behind a memory id. |
+| Recall | Agent tool that searches earlier context or returns exact evidence behind an id. |
 
 ## Where to go next
 

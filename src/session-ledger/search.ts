@@ -1,0 +1,152 @@
+import { renderRecallSourceEntry } from "../serialize.js";
+import { entryIndexForId, findLastCompactionIndex, isSourceEntry } from "./progress.js";
+import {
+	isObservationsDroppedEntry,
+	isObservationsRecordedEntry,
+	isReflectionsRecordedEntry,
+	type Entry,
+} from "./types.js";
+
+export type SearchDocument =
+	| { kind: "observation"; id: string; text: string; timestamp: string; relevance: string; dropped: boolean }
+	| { kind: "reflection"; id: string; text: string }
+	| { kind: "entry"; id: string; text: string; chunk: number };
+
+export type SearchHit = SearchDocument & { score: number };
+
+/** Transcript chunk size; small enough that one hit is readable, large enough to keep a tool call and its context together. */
+export const SEARCH_CHUNK_CHARS = 1_200;
+
+const STOPWORDS = new Set([
+	"the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "have", "has", "had", "not", "but",
+	"you", "your", "our", "its", "into", "than", "then", "them", "they", "what", "when", "where", "which", "who",
+	"will", "would", "can", "could", "should", "been", "being", "also", "about", "there", "their", "these", "those",
+]);
+
+export function tokenize(text: string): string[] {
+	const tokens: string[] = [];
+	for (const raw of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+		if (raw.length < 2 || STOPWORDS.has(raw)) continue;
+		tokens.push(raw);
+	}
+	return tokens;
+}
+
+function chunkText(text: string): string[] {
+	const chunks: string[] = [];
+	let start = 0;
+	while (start < text.length) {
+		let end = Math.min(text.length, start + SEARCH_CHUNK_CHARS);
+		if (end < text.length) {
+			// Prefer a line break in the back half of the window.
+			const newline = text.lastIndexOf("\n", end);
+			if (newline > start + SEARCH_CHUNK_CHARS / 2) end = newline + 1;
+		}
+		const chunk = text.slice(start, end).trim();
+		if (chunk) chunks.push(chunk);
+		start = end;
+	}
+	return chunks;
+}
+
+/**
+ * Transcript entries the agent cannot see: source entries before the latest
+ * compaction's retained tail. Without a compaction the whole branch is in
+ * context and nothing is hidden.
+ */
+export function hiddenSourceEntries(entries: Entry[]): Entry[] {
+	const compactionIndex = findLastCompactionIndex(entries);
+	if (compactionIndex === -1) return [];
+	const firstKeptIndex = entryIndexForId(entries, entries[compactionIndex].firstKeptEntryId);
+	const end = firstKeptIndex === -1 ? compactionIndex : firstKeptIndex;
+	return entries.slice(0, end).filter(isSourceEntry);
+}
+
+/** Every observation and reflection ever recorded on the branch, plus hidden transcript chunks. */
+export function buildSearchCorpus(entries: Entry[]): SearchDocument[] {
+	const droppedObservations = new Set<string>();
+	for (const entry of entries) {
+		if (isObservationsDroppedEntry(entry)) entry.data.observationIds.forEach((id) => droppedObservations.add(id));
+	}
+
+	const docs: SearchDocument[] = [];
+	for (const entry of entries) {
+		if (isObservationsRecordedEntry(entry)) {
+			for (const observation of entry.data.observations) {
+				docs.push({
+					kind: "observation",
+					id: observation.id,
+					text: observation.content,
+					timestamp: observation.timestamp,
+					relevance: observation.relevance,
+					dropped: droppedObservations.has(observation.id),
+				});
+			}
+		} else if (isReflectionsRecordedEntry(entry)) {
+			for (const reflection of entry.data.reflections) {
+				docs.push({ kind: "reflection", id: reflection.id, text: reflection.content });
+			}
+		}
+	}
+	for (const entry of hiddenSourceEntries(entries)) {
+		const rendered = renderRecallSourceEntry(entry);
+		if (!rendered) continue;
+		chunkText(rendered).forEach((text, chunk) => docs.push({ kind: "entry", id: entry.id, text, chunk }));
+	}
+	return docs;
+}
+
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+
+/** BM25 over the corpus; returns one score per document, 0 when no query term matches. */
+export function rankLexical(docs: SearchDocument[], query: string): number[] {
+	const terms = Array.from(new Set(tokenize(query)));
+	if (terms.length === 0 || docs.length === 0) return docs.map(() => 0);
+
+	const termCounts = docs.map((doc) => {
+		const counts = new Map<string, number>();
+		for (const token of tokenize(doc.text)) counts.set(token, (counts.get(token) ?? 0) + 1);
+		return counts;
+	});
+	const lengths = termCounts.map((counts) => Array.from(counts.values()).reduce((sum, n) => sum + n, 0));
+	const averageLength = lengths.reduce((sum, n) => sum + n, 0) / docs.length || 1;
+	const idf = new Map(terms.map((term) => {
+		const containing = termCounts.filter((counts) => counts.has(term)).length;
+		return [term, Math.log(1 + (docs.length - containing + 0.5) / (containing + 0.5))];
+	}));
+
+	return termCounts.map((counts, i) => {
+		let score = 0;
+		for (const term of terms) {
+			const frequency = counts.get(term);
+			if (!frequency) continue;
+			const norm = frequency + BM25_K1 * (1 - BM25_B + (BM25_B * lengths[i]) / averageLength);
+			score += idf.get(term)! * ((frequency * (BM25_K1 + 1)) / norm);
+		}
+		return score;
+	});
+}
+
+/** Highest-scoring documents, keeping only the best chunk of each transcript entry. */
+export function topHits(docs: SearchDocument[], scores: number[], limit: number): SearchHit[] {
+	const ranked = docs
+		.map((doc, i) => ({ ...doc, score: scores[i] }))
+		.filter((hit) => hit.score > 0)
+		.sort((a, b) => b.score - a.score);
+	const seen = new Set<string>();
+	const hits: SearchHit[] = [];
+	for (const hit of ranked) {
+		const key = `${hit.kind}:${hit.id}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		hits.push(hit);
+		if (hits.length === limit) break;
+	}
+	return hits;
+}
+
+export function searchSession(entries: Entry[], query: string, limit: number): SearchHit[] {
+	const docs = buildSearchCorpus(entries);
+	return topHits(docs, rankLexical(docs, query), limit);
+}
