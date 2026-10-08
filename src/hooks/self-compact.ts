@@ -2,7 +2,7 @@ import { Type, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-import { resolveTokenThreshold, resolveWarnAt } from "../config.js";
+import { resolveTokenThreshold, resolveWarnRule } from "../config.js";
 import type { Runtime } from "../runtime.js";
 import { OM_SELF_COMPACT_WARNING, type Entry } from "../session-ledger/index.js";
 
@@ -83,18 +83,20 @@ function isCurrentWarning(details: unknown, cycle: string): boolean {
 	return (details as { cycle?: unknown } | undefined)?.cycle === cycle;
 }
 
-/** Highest warning level already sent this cycle, read from the branch so reloads do not repeat it. */
-function warnedLevelThisCycle(entries: Entry[], cycle: string): number {
+/** Highest warning level and repeat step already sent this cycle, read from the branch so reloads do not repeat them. */
+function warnedProgressThisCycle(entries: Entry[], cycle: string): { level: number; repeat: number } {
 	let level = 0;
+	let repeat = 0;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "compaction") break;
 		if (entry.type !== "custom_message" || entry.customType !== OM_SELF_COMPACT_WARNING) continue;
 		if (!isCurrentWarning(entry.details, cycle)) continue;
-		const sent = (entry.details as { level?: unknown } | undefined)?.level;
-		if (typeof sent === "number" && sent > level) level = sent;
+		const details = entry.details as { level?: unknown; repeat?: unknown } | undefined;
+		if (typeof details?.level === "number" && details.level > level) level = details.level;
+		if (typeof details?.repeat === "number" && details.repeat > repeat) repeat = details.repeat;
 	}
-	return level;
+	return { level, repeat };
 }
 
 export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
@@ -102,7 +104,7 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 	// Only this hook's compaction; the resume turn starts after it is cleared.
 	let compacting: { overlapRecorded: boolean } | undefined;
 	// Queued warnings reach the branch only when delivered.
-	let queued = { cycle: "", level: 0 };
+	let queued = { cycle: "", level: 0, repeat: 0 };
 
 	pi.on("session_start", (_event, ctx) => {
 		runtime.ensureConfig(ctx.cwd);
@@ -128,7 +130,8 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 		// `thinkingLevel` is optional and only present on newer Pi hosts; reading it structurally
 		// keeps this independent of the host version. Absent, `:thinking` rules simply never match.
 		const thinkingLevel = (ctx as { thinkingLevel?: ModelThinkingLevel }).thinkingLevel;
-		const warnAt = resolveWarnAt(runtime.config, ctx.model, thinkingLevel);
+		const warnRule = resolveWarnRule(runtime.config, ctx.model, thinkingLevel);
+		const warnAt = warnRule?.warnAt ?? [];
 		if (warnAt.length === 0) return;
 		// A ratio without a known window never fires.
 		const thresholds = warnAt.map((threshold) => resolveTokenThreshold(threshold, usage.contextWindow, Infinity));
@@ -137,9 +140,25 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 
 		const branch = ctx.sessionManager.getBranch() as Entry[];
 		const cycle = currentWarningCycle(branch);
-		const already = Math.max(warnedLevelThisCycle(branch, cycle), queued.cycle === cycle ? queued.level : 0);
-		if (level <= already) return;
-		queued = { cycle, level };
+		const warned = warnedProgressThisCycle(branch, cycle);
+		const alreadyLevel = Math.max(warned.level, queued.cycle === cycle ? queued.level : 0);
+		const alreadyRepeat = Math.max(warned.repeat, queued.cycle === cycle ? queued.repeat : 0);
+
+		// Past the highest threshold, once the top-level warning has fired, step
+		// absolute reminders up from it every `repeatEvery`. Repeats stay at the
+		// highest level. With no `repeatEvery`, the original L1/L2 gate is intact.
+		const topThreshold = thresholds[thresholds.length - 1];
+		const repeatEvery = warnRule?.repeatEvery === undefined
+			? 0
+			: resolveTokenThreshold(warnRule.repeatEvery, usage.contextWindow, 0);
+		let repeat = 0;
+		if (level >= thresholds.length && alreadyLevel >= thresholds.length && repeatEvery > 0) {
+			repeat = Math.floor((tokens - topThreshold) / repeatEvery);
+			if (repeat <= alreadyRepeat) return;
+		} else if (level <= alreadyLevel) {
+			return;
+		}
+		queued = { cycle, level, repeat };
 
 		const percent = usage.contextWindow > 0 ? Math.round((tokens / usage.contextWindow) * 100) : undefined;
 		const used = percent === undefined ? `${tokens} tokens` : `${percent}% (${tokens} of ${usage.contextWindow} tokens)`;
@@ -152,7 +171,7 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 				customType: OM_SELF_COMPACT_WARNING,
 				content: `Context used: ${used}. ${ask}`,
 				display: true,
-				details: { level, cycle },
+				details: repeat > 0 ? { level, cycle, repeat } : { level, cycle },
 			},
 			{ deliverAs: event.toolResults.length > 0 ? "steer" : "nextTurn" },
 		);

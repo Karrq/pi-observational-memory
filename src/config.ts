@@ -84,6 +84,14 @@ export interface ModelMapEntry {
 export interface WarnAtRule {
 	match: string;
 	warnAt: (number | TokenThreshold)[];
+	/**
+	 * Optional interval for reminders once the highest `warnAt` level has
+	 * fired. Each reminder fires one additional absolute step of this size
+	 * beyond the highest threshold (e.g. ratio 0.05 repeats every 5% of the
+	 * context window past the top threshold). Reminders carry the highest
+	 * level. Unset disables repeats, leaving the L1/L2 behavior unchanged.
+	 */
+	repeatEvery?: number | TokenThreshold;
 }
 
 /**
@@ -353,26 +361,39 @@ export function resolveCompactAfterTokens(config: Config, contextWindow: number 
 }
 
 /**
- * Select the warning thresholds for the active session model.
+ * Select the first `selfCompact.warnAt` rule for the active session model, or
+ * undefined when none match.
  *
  * `selfCompact.warnAt` is a first-match-wins rule list. A rule's `match` is a
  * glob over `"<provider>/<id>"` with an optional trailing `":<thinking>"`
  * predicate. When no rule matches, no warnings are emitted, so a `"*"` rule is
  * the explicit global default.
  */
+export function resolveWarnRule(
+	config: Config,
+	activeModel: unknown,
+	sessionThinking?: ModelThinkingLevel,
+): WarnAtRule | undefined {
+	const key = activeModelKey(activeModel);
+	if (!key) return undefined;
+	for (const rule of config.selfCompact.warnAt) {
+		const selector = parseMatchSelector(rule.match);
+		if (selector.thinking !== undefined && selector.thinking !== sessionThinking) continue;
+		if (globToRegExp(selector.glob).test(key)) return rule;
+	}
+	return undefined;
+}
+
+/**
+ * Select the warning thresholds for the active session model. See
+ * {@link resolveWarnRule}; this is the thresholds-only view of the matched rule.
+ */
 export function resolveWarnAt(
 	config: Config,
 	activeModel: unknown,
 	sessionThinking?: ModelThinkingLevel,
 ): (number | TokenThreshold)[] {
-	const key = activeModelKey(activeModel);
-	if (!key) return [];
-	for (const rule of config.selfCompact.warnAt) {
-		const selector = parseMatchSelector(rule.match);
-		if (selector.thinking !== undefined && selector.thinking !== sessionThinking) continue;
-		if (globToRegExp(selector.glob).test(key)) return rule.warnAt;
-	}
-	return [];
+	return resolveWarnRule(config, activeModel, sessionThinking)?.warnAt ?? [];
 }
 
 /** Retained-tail budget used when `compactionMaxRetainedTokens` is unset and the context window is unknown. */
@@ -700,7 +721,12 @@ function normalizeWarnAtRule(value: unknown): WarnAtRule | undefined {
 	const match = nonEmptyString(value.match);
 	if (!match || !Array.isArray(value.warnAt)) return undefined;
 	const warnAt = value.warnAt.map(parseTokenThreshold).filter((threshold) => threshold !== undefined);
-	return { match, warnAt };
+	const rule: WarnAtRule = { match, warnAt };
+	// A malformed `repeatEvery` is dropped rather than rejecting the rule, like
+	// the individual `warnAt` thresholds.
+	const repeatEvery = parseTokenThreshold(value.repeatEvery);
+	if (repeatEvery !== undefined) rule.repeatEvery = repeatEvery;
+	return rule;
 }
 
 /** Malformed `warnAt` rules are dropped individually; a non-object block is ignored. */

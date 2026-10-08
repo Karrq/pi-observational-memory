@@ -9,7 +9,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	getAgentDir: () => mock.agentDir,
 }));
 
-import { DEFAULTS, loadConfig, parseMatchSelector, readEnvConfig, resolveCompactAfterTokens, resolveConfiguredModel, resolveModelString, resolveWarnAt } from "../src/config.js";
+import { DEFAULTS, loadConfig, parseMatchSelector, readEnvConfig, resolveCompactAfterTokens, resolveConfiguredModel, resolveModelString, resolveWarnAt, resolveWarnRule } from "../src/config.js";
 
 function writeJson(path: string, value: unknown) {
 	mkdirSync(join(path, ".."), { recursive: true });
@@ -82,6 +82,26 @@ describe("V3 config", () => {
 			enabled: true,
 			warnAt: [{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }, 50_000] }],
 		});
+	});
+
+	it("parses repeatEvery on warning rules and drops invalid values", () => {
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": {
+				selfCompact: {
+					enabled: true,
+					warnAt: [
+						{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }], repeatEvery: { type: "ratio", value: 0.05 } },
+						{ match: "b/*", warnAt: [{ type: "ratio", value: 0.3 }], repeatEvery: 5000 },
+						{ match: "c/*", warnAt: [{ type: "ratio", value: 0.4 }], repeatEvery: "bad" },
+					],
+				},
+			},
+		});
+		expect(loadConfig(cwd, {}).selfCompact.warnAt).toEqual([
+			{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }], repeatEvery: { type: "ratio", value: 0.05 } },
+			{ match: "b/*", warnAt: [{ type: "ratio", value: 0.3 }], repeatEvery: 5000 },
+			{ match: "c/*", warnAt: [{ type: "ratio", value: 0.4 }] },
+		]);
 	});
 
 	it("merges global, project, and env V3 settings in order", () => {
@@ -479,6 +499,18 @@ describe("V3 config", () => {
 		it("returns no rules when nothing matches", () => {
 			expect(resolveWarnAt(config, { provider: "openai", id: "gpt" }, "high")).toEqual([]);
 			expect(resolveWarnAt(config, undefined)).toEqual([]);
+		});
+
+		it("exposes the matched rule, including repeatEvery", () => {
+			const withRepeat = {
+				...DEFAULTS,
+				selfCompact: {
+					enabled: true,
+					warnAt: [{ match: "*", warnAt: [{ type: "ratio", value: 0.1 }], repeatEvery: 0.05 }],
+				},
+			} as any;
+			expect(resolveWarnRule(withRepeat, { provider: "a", id: "b" })?.repeatEvery).toBe(0.05);
+			expect(resolveWarnRule(withRepeat, undefined)).toBeUndefined();
 		});
 	});
 

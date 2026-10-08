@@ -3078,15 +3078,15 @@ function resolveReflectAfterTokens(config, contextWindow) {
 function resolveCompactAfterTokens(config, contextWindow) {
   return resolveConfigThreshold(config.compactAfterTokens, contextWindow, THRESHOLD_FALLBACKS.compactAfterTokens);
 }
-function resolveWarnAt(config, activeModel, sessionThinking) {
+function resolveWarnRule(config, activeModel, sessionThinking) {
   const key = activeModelKey(activeModel);
-  if (!key) return [];
+  if (!key) return void 0;
   for (const rule of config.selfCompact.warnAt) {
     const selector = parseMatchSelector(rule.match);
     if (selector.thinking !== void 0 && selector.thinking !== sessionThinking) continue;
-    if (globToRegExp(selector.glob).test(key)) return rule.warnAt;
+    if (globToRegExp(selector.glob).test(key)) return rule;
   }
-  return [];
+  return void 0;
 }
 var COMPACTION_RETAINED_FALLBACK_MAX_TOKENS = 6e4;
 var COMPACTION_RETAINED_CONTEXT_RATIO = 0.5;
@@ -3268,7 +3268,10 @@ function normalizeWarnAtRule(value) {
   const match = nonEmptyString(value.match);
   if (!match || !Array.isArray(value.warnAt)) return void 0;
   const warnAt = value.warnAt.map(parseTokenThreshold).filter((threshold) => threshold !== void 0);
-  return { match, warnAt };
+  const rule = { match, warnAt };
+  const repeatEvery = parseTokenThreshold(value.repeatEvery);
+  if (repeatEvery !== void 0) rule.repeatEvery = repeatEvery;
+  return rule;
 }
 function normalizeSelfCompact(value) {
   if (!isRecord(value)) return void 0;
@@ -5087,25 +5090,31 @@ var SELF_COMPACT_OVERLAP_TYPE = "om.self-compact.overlap";
 var compactContextTool = (runtime) => defineTool({
   name: SELF_COMPACT_TOOL_NAME,
   label: "Compact context",
-  description: "Compact context into memory at a clean breakpoint; recent turns stay verbatim. Ends this turn.",
+  description: "Compact context into memory at a clean breakpoint; recent turns stay verbatim. This ends the current turn. By default the run resumes after compaction; pass continue: false when no work is left, so the completion notice arrives with your next prompt instead.",
   parameters: Type5.Object({
-    resume: Type5.String({
+    note: Type5.String({
       description: "Current task and next step, or what you are waiting on. Kept in context after compaction."
-    })
+    }),
+    continue: Type5.Optional(Type5.Boolean({
+      description: "Whether to resume the run after compaction. Defaults to true. Set false when no work is left; the completion notice is then delivered with the next user prompt instead of restarting the run.",
+      default: true
+    }))
   }),
   renderResult(result, options, theme, context) {
     const status = result.content.map((block) => block.type === "text" ? block.text : "").join("");
-    const resume = context.args.resume?.trim();
+    const note = context.args.note?.trim();
     let text = theme.fg("toolOutput", status);
-    if (options.expanded && resume) text += `
+    if (options.expanded && note) text += `
 
-${theme.fg("muted", "Resume note:")}
-${theme.fg("toolOutput", resume)}`;
+${theme.fg("muted", "Note:")}
+${theme.fg("toolOutput", note)}`;
     return new Text2(text, 0, 0);
   },
   async execute(_toolCallId, params) {
     const scheduled = runtime.selfCompactPending === void 0;
-    if (scheduled) runtime.selfCompactPending = { resume: params.resume?.trim() ?? "" };
+    if (scheduled) {
+      runtime.selfCompactPending = { note: params.note?.trim() ?? "", continue: params.continue ?? true };
+    }
     return {
       content: [{ type: "text", text: scheduled ? "Compaction scheduled." : "Compaction already scheduled." }],
       details: { scheduled },
@@ -5113,11 +5122,19 @@ ${theme.fg("toolOutput", resume)}`;
     };
   }
 });
-function sendResume(pi, resume, failure) {
-  const content = failure ? `Compaction failed: ${failure}. Continue without compacting${resume ? ` from your note:
+function sendResume(pi, note, failure) {
+  const content = failure ? `Compaction failed: ${failure}. Continue without compacting${note ? ` from your note:
 
-${resume}` : "."}` : `Compaction complete. Continue from the resume note in your ${SELF_COMPACT_TOOL_NAME} call.`;
+${note}` : "."}` : `Compaction complete. Continue from the note in your ${SELF_COMPACT_TOOL_NAME} call.`;
   pi.sendMessage({ customType: SELF_COMPACT_RESUME_TYPE, content, display: true }, { triggerTurn: true });
+}
+function sendDeferredResume(pi, note, failure) {
+  const content = failure ? `Compaction failed: ${failure}. Continue without compacting${note ? ` from your note:
+
+${note}` : "."}` : `Compaction complete.${note ? ` Continue from your note:
+
+${note}` : ""}`;
+  pi.sendMessage({ customType: SELF_COMPACT_RESUME_TYPE, content, display: true }, {});
 }
 function currentWarningCycle(entries) {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -5128,22 +5145,24 @@ function currentWarningCycle(entries) {
 function isCurrentWarning(details, cycle) {
   return details?.cycle === cycle;
 }
-function warnedLevelThisCycle(entries, cycle) {
+function warnedProgressThisCycle(entries, cycle) {
   let level = 0;
+  let repeat = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type === "compaction") break;
     if (entry.type !== "custom_message" || entry.customType !== OM_SELF_COMPACT_WARNING) continue;
     if (!isCurrentWarning(entry.details, cycle)) continue;
-    const sent = entry.details?.level;
-    if (typeof sent === "number" && sent > level) level = sent;
+    const details = entry.details;
+    if (typeof details?.level === "number" && details.level > level) level = details.level;
+    if (typeof details?.repeat === "number" && details.repeat > repeat) repeat = details.repeat;
   }
-  return level;
+  return { level, repeat };
 }
 function registerSelfCompact(pi, runtime) {
   let registered = false;
   let compacting;
-  let queued = { cycle: "", level: 0 };
+  let queued = { cycle: "", level: 0, repeat: 0 };
   pi.on("session_start", (_event, ctx) => {
     runtime.ensureConfig(ctx.cwd);
     runtime.selfCompactPending = void 0;
@@ -5165,16 +5184,27 @@ function registerSelfCompact(pi, runtime) {
     if (!usage || usage.tokens === null) return;
     const tokens = usage.tokens;
     const thinkingLevel = ctx.thinkingLevel;
-    const warnAt = resolveWarnAt(runtime.config, ctx.model, thinkingLevel);
+    const warnRule = resolveWarnRule(runtime.config, ctx.model, thinkingLevel);
+    const warnAt = warnRule?.warnAt ?? [];
     if (warnAt.length === 0) return;
     const thresholds = warnAt.map((threshold) => resolveTokenThreshold(threshold, usage.contextWindow, Infinity));
     const level = thresholds.filter((threshold) => tokens >= threshold).length;
     if (level === 0) return;
     const branch = ctx.sessionManager.getBranch();
     const cycle = currentWarningCycle(branch);
-    const already = Math.max(warnedLevelThisCycle(branch, cycle), queued.cycle === cycle ? queued.level : 0);
-    if (level <= already) return;
-    queued = { cycle, level };
+    const warned = warnedProgressThisCycle(branch, cycle);
+    const alreadyLevel = Math.max(warned.level, queued.cycle === cycle ? queued.level : 0);
+    const alreadyRepeat = Math.max(warned.repeat, queued.cycle === cycle ? queued.repeat : 0);
+    const topThreshold = thresholds[thresholds.length - 1];
+    const repeatEvery = warnRule?.repeatEvery === void 0 ? 0 : resolveTokenThreshold(warnRule.repeatEvery, usage.contextWindow, 0);
+    let repeat = 0;
+    if (level >= thresholds.length && alreadyLevel >= thresholds.length && repeatEvery > 0) {
+      repeat = Math.floor((tokens - topThreshold) / repeatEvery);
+      if (repeat <= alreadyRepeat) return;
+    } else if (level <= alreadyLevel) {
+      return;
+    }
+    queued = { cycle, level, repeat };
     const percent = usage.contextWindow > 0 ? Math.round(tokens / usage.contextWindow * 100) : void 0;
     const used = percent === void 0 ? `${tokens} tokens` : `${percent}% (${tokens} of ${usage.contextWindow} tokens)`;
     const ask = level === thresholds.length ? "Finish the current step, then call compact_context before starting new work." : "If the current task is close to done, finish it first. Otherwise call compact_context at the next clean breakpoint.";
@@ -5183,7 +5213,7 @@ function registerSelfCompact(pi, runtime) {
         customType: OM_SELF_COMPACT_WARNING,
         content: `Context used: ${used}. ${ask}`,
         display: true,
-        details: { level, cycle }
+        details: repeat > 0 ? { level, cycle, repeat } : { level, cycle }
       },
       { deliverAs: event.toolResults.length > 0 ? "steer" : "nextTurn" }
     );
@@ -5206,8 +5236,9 @@ function registerSelfCompact(pi, runtime) {
     runtime.selfCompactPending = void 0;
     const hasUI = ctx.hasUI;
     const ui = ctx.ui;
+    const report = (failure) => pending.continue ? sendResume(pi, pending.note, failure) : sendDeferredResume(pi, pending.note, failure);
     if (runtime.compactInFlight) {
-      sendResume(pi, pending.resume, "another compaction is already running");
+      report("another compaction is already running");
       return;
     }
     runtime.compactInFlight = true;
@@ -5217,19 +5248,19 @@ function registerSelfCompact(pi, runtime) {
         onComplete: () => {
           runtime.compactInFlight = false;
           compacting = void 0;
-          sendResume(pi, pending.resume);
+          report();
         },
         onError: (error) => {
           runtime.compactInFlight = false;
           compacting = void 0;
           if (hasUI) ui?.notify(`Observational memory: self-compaction failed: ${error.message}`, "error");
-          sendResume(pi, pending.resume, error.message);
+          report(error.message);
         }
       });
     } catch (error) {
       runtime.compactInFlight = false;
       compacting = void 0;
-      sendResume(pi, pending.resume, error instanceof Error ? error.message : String(error));
+      report(error instanceof Error ? error.message : String(error));
     }
   });
 }
@@ -5607,7 +5638,7 @@ var Runtime = class {
   consolidationAbortController;
   compactInFlight = false;
   compactHookInFlight = false;
-  /** Set by `compact_context`; consumed once the agent run settles. */
+  /** Set by `compact_context`; consumed once the agent run settles. `continue` false defers the completion notice to the next prompt. */
   selfCompactPending;
   resolveFailureNotified = false;
   lastObserverError;

@@ -211,6 +211,84 @@ describe("self-compact", () => {
 		expect(context([user, current])).toBeUndefined();
 	});
 
+	it("repeats the highest-level warning every configured step past the top threshold", () => {
+		const { pi, turnEnd, branch } = setup({
+			warnAt: [{
+				match: "*",
+				warnAt: [{ type: "ratio", value: 0.2 }, { type: "ratio", value: 0.28 }],
+				repeatEvery: { type: "ratio", value: 0.05 },
+			}],
+		});
+		const sent = () => pi.sendMessage.mock.calls.map(([message]: any[]) => ({
+			level: message.details.level,
+			repeat: message.details.repeat,
+		}));
+
+		turnEnd(21_000); // L1
+		turnEnd(29_000); // L2
+		turnEnd(32_000); // below top + 5%
+		turnEnd(33_000); // repeat at 33k (top 28k + 5k)
+		turnEnd(34_000); // same step
+		turnEnd(38_000); // repeat at 38k (+10k)
+		turnEnd(49_000); // jump to +20k: one reminder for step 4
+		expect(sent()).toEqual([
+			{ level: 1, repeat: undefined },
+			{ level: 2, repeat: undefined },
+			{ level: 2, repeat: 1 },
+			{ level: 2, repeat: 2 },
+			{ level: 2, repeat: 4 },
+		]);
+		expect(pi.sendMessage.mock.calls[2][0].content).toContain("Finish the current step");
+
+		// A new cycle restarts at L1 and repeats only after the top level fires again.
+		branch.push({ type: "compaction", id: "cmp-1" });
+		turnEnd(21_000);
+		turnEnd(29_000);
+		turnEnd(33_000);
+		expect(sent().slice(-3)).toEqual([
+			{ level: 1, repeat: undefined },
+			{ level: 2, repeat: undefined },
+			{ level: 2, repeat: 1 },
+		]);
+	});
+
+	it("does not repeat when repeatEvery is absent", () => {
+		const { pi, turnEnd } = setup({
+			warnAt: [{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }, { type: "ratio", value: 0.28 }] }],
+		});
+		turnEnd(21_000);
+		turnEnd(29_000);
+		turnEnd(90_000);
+		turnEnd(99_000);
+		expect(pi.sendMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it("sends the top-level warning before any repeat when a turn jumps past the step", () => {
+		const { pi, turnEnd } = setup({
+			warnAt: [{
+				match: "*",
+				warnAt: [{ type: "ratio", value: 0.2 }, { type: "ratio", value: 0.28 }],
+				repeatEvery: { type: "ratio", value: 0.05 },
+			}],
+		});
+		turnEnd(45_000);
+		expect(pi.sendMessage.mock.calls[0][0].details).toEqual({ level: 2, cycle: "" });
+		turnEnd(45_000);
+		expect(pi.sendMessage.mock.calls[1][0].details).toEqual({ level: 2, cycle: "", repeat: 3 });
+	});
+
+	it("repeats a single top level at the configured step", () => {
+		const { pi, turnEnd } = setup({
+			warnAt: [{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }], repeatEvery: 5_000 }],
+		});
+		turnEnd(20_000);
+		turnEnd(25_000);
+		expect(pi.sendMessage.mock.calls.map(([message]: any[]) => message.details)).toEqual([
+			{ level: 1, cycle: "" },
+			{ level: 1, cycle: "", repeat: 1 },
+		]);
+	});
+
 	it("does not let a stale warning delivered after compaction suppress a new one", () => {
 		const { pi, turnEnd, branch } = setup({ warnAt: [{ match: "*", warnAt: [{ type: "ratio", value: 0.2 }] }] });
 		turnEnd(21_000, []);

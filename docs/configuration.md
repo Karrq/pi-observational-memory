@@ -97,6 +97,7 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `modelMap[].stages` | array of stage names | all stages | Narrows the entry to `observer`, `reflector`, `reflection-dropper`, and/or `dropper`. |
 | `selfCompact.enabled` | boolean | `false` | Gives the agent the `compact_context` tool so it can compact at a breakpoint it chooses. |
 | `selfCompact.warnAt` | array of rules | `[]` | Warning rules, each `{ match, warnAt }`. `match` is a glob over the active session `"<provider>/<id>"` with an optional trailing `":<thinking>"` predicate. First match wins; no match means no warnings, so add a `"*"` rule as the global default. Values are the same number or `{ type, value }` forms as other thresholds. |
+| `selfCompact.warnAt[].repeatEvery` | number or threshold | unset | After the highest `warnAt` level fires, remind again each additional step of this size beyond the top threshold. Reminders carry the highest level. Unset disables repeats. |
 | `recallEmbeddings.enabled` | boolean | `false` | Adds local semantic ranking to `recall` queries. |
 | `recallEmbeddings.model` | string | `Xenova/bge-small-en-v1.5` | transformers.js feature-extraction model id. |
 | `recallEmbeddings.pooling` | `cls` \| `mean` | `cls` | Pooling the model was trained with. |
@@ -369,6 +370,8 @@ Input that arrives before the compaction starts cancels it. Proactive `compactAf
 
 Each selected threshold is compared with Pi's live context usage, which includes the system prompt and tool schemas, unlike `compactAfterTokens`. Each level is sent once per compaction cycle. The highest level asks the agent to finish the current step and then compact before starting new work. Lower levels ask it to finish a nearly done task first, and otherwise compact at the next clean breakpoint. A warning raised mid-run is steered into the current run. One raised after the final reply is attached to your next prompt instead of starting a turn. Warnings are not treated as session content by the observer. After any compaction, including a manual `/compact`, warnings from the earlier cycle stay in the session but are hidden from the model. Warnings saved by older versions count as stale.
 
+A rule can set `repeatEvery` so an ignored top-level warning cannot go silent. Once the highest `warnAt` level has fired, the extension reminds again each additional absolute step of `repeatEvery` beyond that threshold, so ratio `0.05` repeats every 5% of the context window past the top threshold. Reminders reuse the highest level, including its stronger wording, and are sent at most once per step. A reminder is never sent before the highest-level warning itself. Without `repeatEvery` the L1/L2 behavior is unchanged. A sensible step is `0.05` (5%); smaller values warn more often.
+
 ```json
 {
   "observational-memory": {
@@ -376,7 +379,7 @@ Each selected threshold is compared with Pi's live context usage, which includes
     "selfCompact": {
       "enabled": true,
       "warnAt": [
-        { "match": "*:high", "warnAt": [{ "type": "ratio", "value": 0.2 }, { "type": "ratio", "value": 0.28 }] },
+        { "match": "*:high", "warnAt": [{ "type": "ratio", "value": 0.2 }, { "type": "ratio", "value": 0.28 }], "repeatEvery": { "type": "ratio", "value": 0.05 } },
         { "match": "*", "warnAt": [{ "type": "ratio", "value": 0.35 }, { "type": "ratio", "value": 0.45 }] }
       ]
     }
