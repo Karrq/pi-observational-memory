@@ -361,7 +361,7 @@ The first rule pins claude-bridge workers to `low` thinking whatever the session
 
 Default: `{ "enabled": false }`.
 
-When enabled, the agent gets a `compact_context` tool. Calling it ends the current run; once Pi settles, the extension compacts through the normal V3 hook, so memory is rendered without a model call and recent turns stay in the retained tail. The required `resume` note states the current task and next step, or what the agent is waiting on. After compaction a short message starts the next turn and points the agent at the note, which stays in the retained tail as part of the tool call. A failed compaction is reported in that message, which repeats the note so the agent can continue without compacting.
+When enabled, the agent gets a `compact_context` tool. Calling it ends the current run; once Pi settles, the extension compacts through the normal V3 hook, so memory is rendered without a model call and recent turns stay in the retained tail. The required `note` parameter states the current task and next step, or what the agent is waiting on, and stays in the retained tail as part of the tool call. By default, after compaction a short message starts the next turn and points the agent at the note. Passing `continue: false` starts no turn: the completion message, including the note, is recorded in the session and delivered with your next prompt instead, so it survives a restart. A failed compaction is reported the same way and repeats the note so the agent can continue without compacting.
 
 Input that arrives before the compaction starts cancels it. Proactive `compactAfterTokens` compaction keeps working as a backstop.
 

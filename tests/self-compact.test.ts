@@ -59,7 +59,7 @@ describe("self-compact", () => {
 		const { pi, runtime, ctx, settleSync, tool } = setup();
 		expect(tool().name).toBe(SELF_COMPACT_TOOL_NAME);
 
-		const result = await tool().execute("call-1", { resume: "Finish step 3." });
+		const result = await tool().execute("call-1", { note: "Finish step 3." });
 		expect(result.terminate).toBe(true);
 		expect(ctx.compact).not.toHaveBeenCalled();
 
@@ -82,7 +82,7 @@ describe("self-compact", () => {
 		const { pi, ctx, settleSync, handlers, tool } = setup();
 		const agentStart = () => handlers.get("agent_start")!({ type: "agent_start" }, ctx);
 
-		await tool().execute("call-1", { resume: "Next." });
+		await tool().execute("call-1", { note: "Next." });
 		settleSync();
 		agentStart();
 		agentStart();
@@ -94,11 +94,11 @@ describe("self-compact", () => {
 		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
 	});
 
-	it("shows the resume note only when the result is expanded", () => {
+	it("shows the note only when the result is expanded", () => {
 		const { tool } = setup();
 		const theme = { fg: (_color: string, text: string) => text };
 		const result = { content: [{ type: "text", text: "Compaction scheduled." }], details: { scheduled: true } };
-		const context = { args: { resume: "Finish step 3." } };
+		const context = { args: { note: "Finish step 3." } };
 		const render = (expanded: boolean) =>
 			tool().renderResult(result, { expanded, isPartial: false }, theme, context).render(80).join("\n");
 
@@ -107,11 +107,11 @@ describe("self-compact", () => {
 		expect(render(true)).toContain("Finish step 3.");
 	});
 
-	it("always starts a turn and repeats the note only on failure", async () => {
+	it("starts a turn by default and repeats the note only on failure", async () => {
 		const { pi, ctx, settle, tool } = setup();
-		expect(tool().parameters.required).toEqual(["resume"]);
+		expect(tool().parameters.required).toEqual(["note"]);
 
-		await tool().execute("call-1", { resume: "" });
+		await tool().execute("call-1", { note: "" });
 		await settle();
 		ctx.compact.mock.calls[0][0].onComplete({});
 		expect(pi.sendMessage).toHaveBeenCalledWith(
@@ -119,7 +119,7 @@ describe("self-compact", () => {
 			{ triggerTurn: true },
 		);
 
-		await tool().execute("call-2", { resume: "Next." });
+		await tool().execute("call-2", { note: "Next." });
 		await settle();
 		ctx.compact.mock.calls[1][0].onError(new Error("Nothing to compact"));
 		expect(pi.sendMessage).toHaveBeenLastCalledWith(
@@ -127,6 +127,44 @@ describe("self-compact", () => {
 			{ triggerTurn: true },
 		);
 		expect(pi.sendMessage.mock.calls[1][0].content).toContain("Next.");
+	});
+
+	it("exposes an optional continue parameter that defaults to true", () => {
+		const { tool } = setup();
+		expect(tool().parameters.required).toEqual(["note"]);
+		expect(tool().parameters.properties.continue).toMatchObject({ type: "boolean", default: true });
+	});
+
+	it("defers the completion notice to the next prompt when continue is false", async () => {
+		const { pi, ctx, settle, tool } = setup();
+		const result = await tool().execute("call-1", { note: "Nothing left; waiting on the user.", continue: false });
+		expect(result.terminate).toBe(true);
+
+		await settle();
+		ctx.compact.mock.calls[0][0].onComplete({});
+		// Empty options = Pi appends the custom message (persisted) and starts no turn, so it
+		// reaches the model with the next user prompt and survives a restart.
+		expect(pi.sendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				customType: SELF_COMPACT_RESUME_TYPE,
+				content: expect.stringContaining("Compaction complete."),
+			}),
+			{},
+		);
+		expect(pi.sendMessage.mock.calls[0][1]).not.toHaveProperty("triggerTurn");
+		expect(pi.sendMessage.mock.calls[0][0].content).toContain("Nothing left; waiting on the user.");
+	});
+
+	it("defers a failed compaction when continue is false and still repeats the note", async () => {
+		const { pi, ctx, settle, tool } = setup();
+		await tool().execute("call-1", { note: "Next.", continue: false });
+		await settle();
+		ctx.compact.mock.calls[0][0].onError(new Error("Nothing to compact"));
+		expect(pi.sendMessage).toHaveBeenLastCalledWith(
+			expect.objectContaining({ content: expect.stringContaining("Compaction failed: Nothing to compact") }),
+			{},
+		);
+		expect(pi.sendMessage.mock.calls[0][0].content).toContain("Next.");
 	});
 
 	it("warns once per threshold per compaction cycle, attaching idle warnings to the next prompt", () => {

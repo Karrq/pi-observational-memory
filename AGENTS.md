@@ -43,6 +43,16 @@ warnings. Session thinking is read from `ExtensionContext.thinkingLevel` and plu
 `ResolveCtx.thinkingLevel` and `ConsolidationCtx.thinkingLevel`; it feeds `$thinking` substitution
 and warnAt matching only. Tests: `tests/config.test.ts`, `tests/self-compact.test.ts`.
 
+## Self-compact tool (`compact_context`)
+
+The tool takes `note` (required) and `continue` (optional, default true). `continue: true` resumes the
+run after compaction via `sendMessage(..., { triggerTurn: true })`. `continue: false` must start no
+turn: it delivers the notice as an appended `om.self-compact.resume` custom message
+(`sendMessage(msg, {})`). Append is deliberate — Pi keeps `deliverAs: "nextTurn"` messages in an
+in-memory queue (`_pendingNextTurnMessages`) that a restart drops, while an appended custom message
+is persisted to the session ledger and included in the next prompt. Both paths share
+`sendResume`/`sendDeferredResume` in `src/hooks/self-compact.ts`. Tests: `tests/self-compact.test.ts`.
+
 ## Prebuilt extension entry
 
 `pi.extensions` loads the committed prebuilt module at `dist/index.ts`, so `src/` edits need

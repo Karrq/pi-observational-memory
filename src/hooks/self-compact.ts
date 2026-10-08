@@ -15,22 +15,30 @@ const compactContextTool = (runtime: Runtime) => defineTool({
 	name: SELF_COMPACT_TOOL_NAME,
 	label: "Compact context",
 	description:
-		"Compact context into memory at a clean breakpoint; recent turns stay verbatim. Ends this turn.",
+		"Compact context into memory at a clean breakpoint; recent turns stay verbatim. This ends the current turn. "
+		+ "By default the run resumes after compaction; pass continue: false when no work is left, so the completion notice arrives with your next prompt instead.",
 	parameters: Type.Object({
-		resume: Type.String({
+		note: Type.String({
 			description: "Current task and next step, or what you are waiting on. Kept in context after compaction.",
 		}),
+		continue: Type.Optional(Type.Boolean({
+			description:
+				"Whether to resume the run after compaction. Defaults to true. Set false when no work is left; the completion notice is then delivered with the next user prompt instead of restarting the run.",
+			default: true,
+		})),
 	}),
 	renderResult(result, options, theme, context) {
 		const status = result.content.map((block) => (block.type === "text" ? block.text : "")).join("");
-		const resume = context.args.resume?.trim();
+		const note = context.args.note?.trim();
 		let text = theme.fg("toolOutput", status);
-		if (options.expanded && resume) text += `\n\n${theme.fg("muted", "Resume note:")}\n${theme.fg("toolOutput", resume)}`;
+		if (options.expanded && note) text += `\n\n${theme.fg("muted", "Note:")}\n${theme.fg("toolOutput", note)}`;
 		return new Text(text, 0, 0);
 	},
 	async execute(_toolCallId, params) {
 		const scheduled = runtime.selfCompactPending === undefined;
-		if (scheduled) runtime.selfCompactPending = { resume: params.resume?.trim() ?? "" };
+		if (scheduled) {
+			runtime.selfCompactPending = { note: params.note?.trim() ?? "", continue: params.continue ?? true };
+		}
 		return {
 			content: [{ type: "text", text: scheduled ? "Compaction scheduled." : "Compaction already scheduled." }],
 			details: { scheduled },
@@ -40,11 +48,23 @@ const compactContextTool = (runtime: Runtime) => defineTool({
 });
 
 // On success the retained tail already holds the tool call and its note, so only the failure repeats it.
-function sendResume(pi: ExtensionAPI, resume: string, failure?: string): void {
+function sendResume(pi: ExtensionAPI, note: string, failure?: string): void {
 	const content = failure
-		? `Compaction failed: ${failure}. Continue without compacting${resume ? ` from your note:\n\n${resume}` : "."}`
-		: `Compaction complete. Continue from the resume note in your ${SELF_COMPACT_TOOL_NAME} call.`;
+		? `Compaction failed: ${failure}. Continue without compacting${note ? ` from your note:\n\n${note}` : "."}`
+		: `Compaction complete. Continue from the note in your ${SELF_COMPACT_TOOL_NAME} call.`;
 	pi.sendMessage({ customType: SELF_COMPACT_RESUME_TYPE, content, display: true }, { triggerTurn: true });
+}
+
+/**
+ * Report for a `continue: false` call, which must not start a turn. Appending the
+ * custom message to the session (no `triggerTurn`) puts it in the next prompt's context
+ * and persists it, so a restart between compaction and the next user turn cannot drop it.
+ */
+function sendDeferredResume(pi: ExtensionAPI, note: string, failure?: string): void {
+	const content = failure
+		? `Compaction failed: ${failure}. Continue without compacting${note ? ` from your note:\n\n${note}` : "."}`
+		: `Compaction complete.${note ? ` Continue from your note:\n\n${note}` : ""}`;
+	pi.sendMessage({ customType: SELF_COMPACT_RESUME_TYPE, content, display: true }, {});
 }
 
 /** The latest compaction's entry id, or "" before the first compaction. */
@@ -166,9 +186,13 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 		runtime.selfCompactPending = undefined;
 		const hasUI = ctx.hasUI;
 		const ui = ctx.ui;
+		// `continue: false` means the agent is done, so the notice is appended for the next
+		// prompt instead of starting a turn; every other outcome resumes immediately.
+		const report = (failure?: string) =>
+			pending.continue ? sendResume(pi, pending.note, failure) : sendDeferredResume(pi, pending.note, failure);
 
 		if (runtime.compactInFlight) {
-			sendResume(pi, pending.resume, "another compaction is already running");
+			report("another compaction is already running");
 			return;
 		}
 		runtime.compactInFlight = true;
@@ -181,19 +205,19 @@ export function registerSelfCompact(pi: ExtensionAPI, runtime: Runtime): void {
 				onComplete: () => {
 					runtime.compactInFlight = false;
 					compacting = undefined;
-					sendResume(pi, pending.resume);
+					report();
 				},
 				onError: (error: { message: string }) => {
 					runtime.compactInFlight = false;
 					compacting = undefined;
 					if (hasUI) ui?.notify(`Observational memory: self-compaction failed: ${error.message}`, "error");
-					sendResume(pi, pending.resume, error.message);
+					report(error.message);
 				},
 			});
 		} catch (error) {
 			runtime.compactInFlight = false;
 			compacting = undefined;
-			sendResume(pi, pending.resume, error instanceof Error ? error.message : String(error));
+			report(error instanceof Error ? error.message : String(error));
 		}
 	});
 }
