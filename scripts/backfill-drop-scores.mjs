@@ -1,11 +1,18 @@
 #!/usr/bin/env node
-// One-off reconciliation: re-score "unscored" drop-score rows against a now-working
-// endpoint, using the exact pool each historical dropper run actually saw.
+// Re-score "unscored" drop-score rows against a now-working endpoint, one dropper
+// run at a time.
 //
 // Usage: npx tsx scripts/backfill-drop-scores.mjs \
 //   <sessionJsonlPath> <dropScoresNdjsonPath> <endpoint> <model>
+//
+// A run's pool comes from the score log itself: `recordDropScores` writes one row
+// per observation the dropper saw, so a group's observation ids are exactly that
+// pool, and the session file supplies the text. No ledger replay or drop-event
+// matching is involved, which removes the alignment failures that hit sessions
+// where a drop event had no matching score group.
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { scoreObservations } from "../src/agents/dropper/system-one/agent.js";
 
 const [sessionPath, scoresPath, endpoint, model] = process.argv.slice(2);
@@ -17,6 +24,45 @@ if (!sessionPath || !scoresPath || !endpoint || !model) {
 const VETO_THRESHOLD = 0.15;
 const DROP_THRESHOLD = 0.75;
 const MAX_QUESTIONS_PER_REQUEST = 250;
+// Stop after this many scoring runs, so a batch can be bounded to a time budget.
+// Resumable: a later invocation skips the runs already scored. 0 or unset = no cap.
+const MAX_SCORING_RUNS = Number(process.env.OM_BACKFILL_MAX_RUNS ?? 0) || Number.POSITIVE_INFINITY;
+// Undici's fetch caps header wait at 300s, which a queued server can exceed. Talk
+// HTTP directly so a request can outlast a busy server queue. Override with env.
+const REQUEST_TIMEOUT_MS = Number(process.env.OM_BACKFILL_TIMEOUT_MS ?? 3_600_000);
+
+/** POST one System One request, waiting as long as REQUEST_TIMEOUT_MS for headers. */
+function postSystemOne(url, body) {
+	return new Promise((resolve, reject) => {
+		const target = new URL(url);
+		const data = JSON.stringify(body);
+		const request = httpRequest(
+			{
+				hostname: target.hostname,
+				port: target.port,
+				path: target.pathname,
+				method: "POST",
+				headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) },
+			},
+			(response) => {
+				const chunks = [];
+				response.on("data", (chunk) => chunks.push(chunk));
+				response.on("end", () => {
+					const text = Buffer.concat(chunks).toString("utf8");
+					if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+						reject(new Error(`System One request to ${url} failed with ${response.statusCode} ${text.slice(0, 400)}`));
+						return;
+					}
+					try { resolve(JSON.parse(text)); } catch (error) { reject(error); }
+				});
+			},
+		);
+		request.setTimeout(REQUEST_TIMEOUT_MS, () =>
+			request.destroy(new Error(`System One request to ${url} timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+		request.on("error", reject);
+		request.end(data);
+	});
+}
 
 /**
  * The script runs outside pi, so it cannot use ctx.modelRegistry. It speaks the
@@ -25,21 +71,17 @@ const MAX_QUESTIONS_PER_REQUEST = 250;
  */
 function httpRegistry(url, model) {
 	const endpoint = `${url.replace(/\/+$/, "")}/v1/systemone`;
+	const classifierModel = { provider: "local-jev", id: model };
 	return {
-		getModelsOfType: (type, provider) => (type === "classifier" && provider === "local-jev" ? [{ provider, id: model }] : []),
-		classify: async (_model, context, options) => {
+		getModelsOfType: (type, provider) => (type === "classifier" && provider === "local-jev" ? [classifierModel] : []),
+		findOfType: (type, provider, id) =>
+			type === "classifier" && provider === "local-jev" && id === model ? classifierModel : undefined,
+		classify: async (_model, context) => {
 			const questions = Object.fromEntries(
 				Object.entries(context.questions).map(([id, question]) =>
 					[id, question.type === "bool" ? { ...question, type: "noul" } : question]),
 			);
-			const response = await fetch(endpoint, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ state: context.state, model, questions }),
-				signal: options?.signal,
-			});
-			if (!response.ok) throw new Error(`System One request to ${endpoint} failed with ${response.status}`);
-			const payload = await response.json();
+			const payload = await postSystemOne(endpoint, { state: context.state, model, questions });
 			const answers = {};
 			for (const [id, answer] of Object.entries(payload.answers ?? {})) {
 				answers[id] = answer.type === "noul" ? { type: "bool", probability: answer.noul } : answer;
@@ -53,14 +95,15 @@ function dropProbability(signals) {
 	return Math.max(signals.redundant, signals.superseded, signals.lowSignal) * signals.safety;
 }
 
-// Replay the ledger to find, for every real om.observations.dropped event, the
-// active pool (recorded minus dropped-so-far) and reflections-so-far immediately
-// before that event was applied. That is exactly the input a dropper run saw.
-function replayRuns(sessionPath) {
-	const recorded = new Map();
-	const dropped = new Set();
+/**
+ * Everything the session ever recorded: observation text by id, reflection text by
+ * id, and the times reflections were added or dropped, so the reflection set of a
+ * past run can be reconstructed.
+ */
+function loadMemory(sessionPath) {
+	const observations = new Map();
 	const reflections = new Map();
-	const runs = [];
+	const reflectionEvents = []; // { ts, add? , drop? }, timestamp-ordered
 
 	for (const line of readFileSync(sessionPath, "utf-8").split("\n")) {
 		if (!line.trim()) continue;
@@ -70,23 +113,36 @@ function replayRuns(sessionPath) {
 		} catch {
 			continue;
 		}
-		if (entry.type !== "custom") continue;
 		const data = entry.data ?? {};
-		if (entry.customType === "om.observations.recorded") {
-			for (const o of data.observations ?? []) recorded.set(o.id, o);
-		} else if (entry.customType === "om.reflections.recorded") {
-			for (const r of data.reflections ?? []) reflections.set(r.id, r);
-		} else if (entry.customType === "om.observations.dropped") {
-			const activeBefore = [...recorded.values()].filter((o) => !dropped.has(o.id));
-			runs.push({
-				droppedIds: data.observationIds ?? [],
-				observations: activeBefore,
-				reflections: [...reflections.values()],
-			});
-			for (const id of data.observationIds ?? []) dropped.add(id);
+		if (entry.type === "custom" && entry.customType === "om.observations.recorded") {
+			for (const observation of data.observations ?? []) observations.set(observation.id, observation);
+		} else if (entry.type === "custom" && entry.customType === "om.reflections.recorded") {
+			for (const reflection of data.reflections ?? []) {
+				reflections.set(reflection.id, reflection);
+				reflectionEvents.push({ ts: entry.timestamp, add: reflection.id });
+			}
+		} else if (entry.type === "custom" && entry.customType === "om.reflections.dropped") {
+			for (const id of data.reflectionIds ?? []) reflectionEvents.push({ ts: entry.timestamp, drop: id });
+		} else if (entry.type === "compaction" && entry.details?.type === "om.folded" && entry.details?.version === 1) {
+			// Fallback text for anything a truncated branch no longer carries directly.
+			for (const observation of entry.details.observations ?? []) if (!observations.has(observation.id)) observations.set(observation.id, observation);
+			for (const reflection of entry.details.reflections ?? []) if (!reflections.has(reflection.id)) reflections.set(reflection.id, reflection);
 		}
 	}
-	return runs;
+
+	reflectionEvents.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+	return { observations, reflections, reflectionEvents };
+}
+
+/** Reflections active at ts: recorded at or before ts, minus those dropped at or before. */
+function reflectionsAt(memory, ts) {
+	const active = new Set();
+	for (const event of memory.reflectionEvents) {
+		if (event.ts > ts) break;
+		if (event.add) active.add(event.add);
+		else if (event.drop) active.delete(event.drop);
+	}
+	return [...active].map((id) => memory.reflections.get(id)).filter(Boolean);
 }
 
 function groupByTs(rows) {
@@ -102,45 +158,37 @@ function groupByTs(rows) {
 	return order.map((ts) => ({ ts, rows: byTs.get(ts) }));
 }
 
+const memory = loadMemory(sessionPath);
 const rawLines = readFileSync(scoresPath, "utf-8").split("\n").filter((l) => l.trim());
 const rows = rawLines.map((l) => JSON.parse(l));
 const runGroups = groupByTs(rows);
-const ledgerRuns = replayRuns(sessionPath);
-
-// Match run groups to ledger events from the tail: shadow mode was enabled partway
-// through these sessions' history, so only the last N ledger drop events correspond
-// to the N run groups actually present in the score log.
-const matched = ledgerRuns.slice(-runGroups.length);
-if (matched.length !== runGroups.length) {
-	console.error(`could not align ${runGroups.length} run group(s) with ${ledgerRuns.length} ledger drop event(s)`);
-	process.exit(1);
-}
-
-for (let i = 0; i < runGroups.length; i++) {
-	const group = runGroups[i];
-	const ledgerRun = matched[i];
-	const groupIds = new Set(group.rows.map((r) => r.observationId));
-	const poolIds = new Set(ledgerRun.observations.map((o) => o.id));
-	const missing = [...groupIds].filter((id) => !poolIds.has(id));
-	if (missing.length > 0) {
-		console.error(`run ${i} (${group.ts}): ${missing.length} scored id(s) not in reconstructed pool, alignment is wrong`);
-		process.exit(1);
-	}
-	console.error(`run ${i} (${group.ts}): reconstructed pool ok, ${ledgerRun.observations.length} observations, ${ledgerRun.reflections.length} reflections`);
-}
 
 const updatedByKey = new Map(); // `${ts}:${observationId}` -> patch fields
+let scoringRuns = 0;
 
 for (let i = 0; i < runGroups.length; i++) {
 	const group = runGroups[i];
-	const ledgerRun = matched[i];
 	const unscored = group.rows.filter((r) => r.systemOneDecision === "unscored");
 	if (unscored.length === 0) {
 		console.error(`run ${i} (${group.ts}): nothing to backfill`);
 		continue;
 	}
+	if (scoringRuns >= MAX_SCORING_RUNS) {
+		const remaining = runGroups.slice(i).filter((g) => g.rows.some((r) => r.systemOneDecision === "unscored")).length;
+		console.error(`run ${i} (${group.ts}): reached OM_BACKFILL_MAX_RUNS=${MAX_SCORING_RUNS}, stopping (${remaining} scoring run(s) left)`);
+		break;
+	}
 
-	console.error(`run ${i} (${group.ts}): scoring ${unscored.length} observation(s) against ${endpoint} ...`);
+	const missingIds = group.rows.filter((r) => !memory.observations.has(r.observationId)).map((r) => r.observationId);
+	if (missingIds.length > 0) {
+		console.error(`run ${i} (${group.ts}): ${missingIds.length} observation(s) have no recorded content, skipping`);
+		continue;
+	}
+
+	scoringRuns++;
+	const pool = group.rows.map((r) => memory.observations.get(r.observationId));
+	const reflections = reflectionsAt(memory, group.ts);
+	console.error(`run ${i} (${group.ts}): scoring ${unscored.length} of ${pool.length} observation(s), ${reflections.length} reflection(s) against ${endpoint} ...`);
 	const t0 = Date.now();
 	const { signalsById } = await scoreObservations({
 		config: {
@@ -150,11 +198,11 @@ for (let i = 0; i < runGroups.length; i++) {
 			vetoThreshold: VETO_THRESHOLD,
 			dropThreshold: DROP_THRESHOLD,
 			maxQuestionsPerRequest: MAX_QUESTIONS_PER_REQUEST,
-			requestTimeoutMs: 300000,
+			requestTimeoutMs: REQUEST_TIMEOUT_MS,
 		},
 		registry: httpRegistry(endpoint, model),
-		reflections: ledgerRun.reflections,
-		observations: ledgerRun.observations,
+		reflections,
+		observations: pool,
 		targetTokens: 0,
 	});
 	console.error(`run ${i}: scored in ${((Date.now() - t0) / 1000).toFixed(1)}s, ${signalsById.size} usable signal sets`);
@@ -169,10 +217,25 @@ for (let i = 0; i < runGroups.length; i++) {
 	}
 }
 
-const patchedRows = rows.map((row) => {
+// Re-read at write time rather than rewriting the start-of-run snapshot: a live
+// session can append to this same log while we score, and rewriting the whole
+// file from the old copy would clobber those rows. Patches are keyed by
+// `ts:observationId`, which a later run never reuses, so only rows from our
+// snapshot are touched and anything appended since is preserved verbatim.
+const currentLines = readFileSync(scoresPath, "utf-8").split("\n").filter((line) => line.trim());
+let patchedCount = 0;
+const mergedLines = currentLines.map((line) => {
+	let row;
+	try {
+		row = JSON.parse(line);
+	} catch {
+		return line;
+	}
 	const patch = updatedByKey.get(`${row.ts}:${row.observationId}`);
-	return patch ? { ...row, ...patch } : row;
+	if (!patch) return line;
+	patchedCount++;
+	return JSON.stringify({ ...row, ...patch });
 });
 
-writeFileSync(scoresPath, patchedRows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf-8");
-console.error(`wrote ${patchedRows.length} rows (${updatedByKey.size} backfilled) to ${scoresPath}`);
+writeFileSync(scoresPath, mergedLines.join("\n") + "\n", "utf-8");
+console.error(`wrote ${mergedLines.length} rows (${patchedCount} backfilled) to ${scoresPath}`);
